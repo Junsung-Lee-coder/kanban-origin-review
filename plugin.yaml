@@ -1,0 +1,6 @@
+name: kanban-origin-review
+version: 0.2.0
+description: "Monitor Kanban root families and inject one bounded internal review turn into the creator Discord session after stable heartbeat quiescence."
+author: "Contributors"
+provides_hooks:
+  - pre_gateway_dispatch
