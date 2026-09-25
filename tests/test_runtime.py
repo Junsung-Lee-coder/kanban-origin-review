@@ -1,13 +1,23 @@
-"""Isolated functional tests for the public plugin source."""
+"""Isolated functional tests for the public plugin source.
+
+Every test is synthetic and privacy-safe: fixture identifiers are invented
+strings, no real board/session/Discord identifiers appear, and the suite
+installs local shims for the Hermes Gateway types so no live Gateway,
+plugin, board, or session state is ever opened.
+"""
 from __future__ import annotations
 
 import asyncio
+import enum
 import hashlib
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
+import tempfile
 import threading
+import time
 import types
 import unittest
 from dataclasses import dataclass, field
@@ -37,21 +47,15 @@ gateway_platforms.__path__ = []
 gateway_base = types.ModuleType("gateway.platforms.base")
 
 
-class Platform:
-    def __init__(self, value: Any):
-        self.value = str(value)
+class Platform(enum.Enum):
+    """Enum-shaped stand-in for the installed gateway Platform."""
 
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, Platform) and self.value == other.value
-
-    def __hash__(self) -> int:
-        return hash(self.value)
-
-    def __repr__(self) -> str:
-        return f"Platform({self.value!r})"
+    DISCORD = "discord"
+    API_SERVER = "api_server"
+    LOCAL = "local"
+    RELAY = "relay"
 
 
-Platform.DISCORD = Platform("discord")
 gateway_config.Platform = Platform
 
 
@@ -132,9 +136,9 @@ runtime_spec.loader.exec_module(mod)
 
 # ---- fixtures -------------------------------------------------------------------
 PROFILE = "default"
-CREATOR_CHAT = "fixture-creator-chat"
-WRONG_SINK_CHAT = "fixture-wrong-sink"
-SHARED_THREAD = "fixture-shared-thread"
+CREATOR_CHAT = "synthetic-creator-chat"
+WRONG_SINK_CHAT = "synthetic-wrong-sink"
+SHARED_THREAD = "synthetic-shared-thread"
 
 
 def make_source(
@@ -154,7 +158,7 @@ def make_source(
     guild_id: str | None = None,
 ) -> SessionSource:
     return SessionSource(
-        platform=Platform("discord"),
+        platform=Platform.DISCORD,
         chat_id=chat_id,
         chat_name=chat_name,
         chat_type=chat_type,
@@ -228,13 +232,31 @@ class Runner:
         self.session_store = store
         self._adapters: dict[tuple[str, str], Any] = {}
         if adapter is not None:
-            self._adapters[("discord", PROFILE)] = adapter
+            self._adapters[(Platform.DISCORD.value, PROFILE)] = adapter
 
-    def _authorization_adapter(self, platform: Platform, profile: str | None) -> Any:
-        return self._adapters.get((platform.value, profile or PROFILE))
+    def _authorization_adapter(self, platform: Any, profile: str | None) -> Any:
+        value = platform.value if isinstance(platform, Platform) else str(platform)
+        return self._adapters.get((value, profile or PROFILE))
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         return session_key_for_source(source)
+
+
+class HostRunner:
+    """A runner with no transport adapter at all: host-internal delivery."""
+
+    def __init__(self, store: Store):
+        self.session_store = store
+        self.host_events: list[MessageEvent] = []
+
+    def _authorization_adapter(self, platform: Any, profile: str | None) -> Any:
+        return None
+
+    def _session_key_for_source(self, source: SessionSource) -> str:
+        return session_key_for_source(source)
+
+    async def _handle_message(self, event: MessageEvent) -> None:
+        self.host_events.append(event)
 
 
 def session_key(chat_id: str) -> str:
@@ -247,7 +269,7 @@ KEY_WRONG = session_key(WRONG_SINK_CHAT)
 DEFAULT_ENTRIES = [
     Entry("session-creator", KEY_CREATOR, make_source(CREATOR_CHAT, thread_id=CREATOR_CHAT)),
     Entry("session-wrong", KEY_WRONG, make_source(WRONG_SINK_CHAT, thread_id=WRONG_SINK_CHAT)),
-    Entry("session-channel", session_key("fixture-channel"), make_source("fixture-channel", chat_type="channel")),
+    Entry("session-channel", session_key("synthetic-channel"), make_source("synthetic-channel", chat_type="channel")),
 ]
 
 
@@ -273,29 +295,48 @@ def fresh(entries: list[Entry] | None = None, adapter: Any = None) -> Runner:
     )
 
 
-def root_rows(body: str) -> list[dict[str, Any]]:
+# Board rows: two-row family layout. The family ROOT (classification unit) is
+# the CHILDLESS SINK; the parentless anchor row carries the provenance body.
+PROVENANCE_BODY = provenance(thread_id=CREATOR_CHAT)
+BOARD_LINKS = (("root-fixture", "child-fixture"),)
+
+
+def family_rows(
+    *,
+    root_status: str = "ready",
+    sink_status: str = "triage",
+    root_body: str = PROVENANCE_BODY,
+    sink_body: str = "",
+) -> list[dict[str, Any]]:
     return [
-        {"id": "root-fixture", "title": "root", "status": "ready", "assignee": "builder", "body": body},
-        {"id": "child-fixture", "title": "child", "status": "todo", "assignee": "builder", "body": ""},
+        {"id": "root-fixture", "title": "root", "status": root_status, "assignee": "builder", "body": root_body},
+        {"id": "child-fixture", "title": "child", "status": sink_status, "assignee": None, "body": sink_body},
     ]
 
 
-def make_trigger(target: Any, key: str = "receipt-fixture") -> Any:
-    snapshot = core_mod.FamilySnapshot(
-        state="heartbeat_quiescent",
-        fingerprint="snapshot-fixture",
-        counts={"ready": 1},
-        blocked_ids=(),
-        live_task_ids=(),
-        tasks=(),
-    )
+LIVE_ROWS = family_rows(root_status="running", sink_status="running")
+QUIET_ROWS = family_rows(root_status="ready", sink_status="triage")
+QUIET_ROWS_NO_PROVENANCE = family_rows(root_status="ready", sink_status="triage", root_body="")
+QUIET_ROWS_MALFORMED = family_rows(
+    root_status="ready",
+    sink_status="triage",
+    root_body="[creator-session-provenance/v1]{bad}[/creator-session-provenance/v1]",
+)
+
+
+def classify_current(rows: list[dict[str, Any]]):
+    return core_mod.classify_family(rows, root_task_id="child-fixture", links=BOARD_LINKS)
+
+
+def make_trigger(target: Any, key: str = "synthetic-receipt") -> Any:
+    snapshot = FamilySnapshot_quiet()
     return mod.Trigger(
         review_key=key,
-        board="board-fixture",
-        root_task_id="root-fixture",
-        root_title="root",
+        board="board-synthetic",
+        root_task_id="child-fixture",
+        root_title="child",
         target=target,
-        outcome="heartbeat_quiescent",
+        outcome=snapshot.state,
         fingerprint=snapshot.fingerprint,
         episode=1,
         attempt=1,
@@ -303,426 +344,53 @@ def make_trigger(target: Any, key: str = "receipt-fixture") -> Any:
     )
 
 
-async def run_tick(runner: Runner, state_path: Path, tasks: list[dict[str, Any]]) -> dict[str, Any]:
-    state = mod.StateStore(str(state_path))
-    runtime = mod.OriginReviewRuntime(runner=runner, state_store=state, poll_seconds=1)
-    runtime.board_paths = lambda: {"board-fixture": Path("/not-opened.sqlite3")}
-    original = mod.read_board_graph
-    mod.read_board_graph = lambda _path: (tasks, ())
-    try:
-        return await runtime.tick()
-    finally:
-        mod.read_board_graph = original
-        state.close()
+def FamilySnapshot_quiet():
+    return core_mod.FamilySnapshot(
+        state=core_mod.STATE_ACTION_REQUIRED,
+        fingerprint="snapshot-synthetic",
+        counts={"triage": 1},
+        blocked_ids=(),
+        live_task_ids=(),
+        tasks=(),
+    )
 
 
-# ---- acceptance cases -----------------------------------------------------------
-class ExactKeyAndAdapterRetention(unittest.TestCase):
-    def test_exact_session_key_resolves_to_one_stored_record(self):
-        runner = fresh()
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
-        )
-        self.assertTrue(decision.ready, decision.reason_code)
-        self.assertEqual(decision.target.session_id, "session-creator")
-        self.assertEqual(decision.target.session_key, KEY_CREATOR)
-
-    def test_ready_decision_retains_exact_adapter_object(self):
-        adapter = PropertyAdapter()
-        runner = fresh(adapter=adapter)
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
-        )
-        self.assertTrue(decision.ready, decision.reason_code)
-        self.assertIs(decision.adapter, adapter)
+def make_live_snapshot():
+    return core_mod.FamilySnapshot(
+        state=core_mod.STATE_ACTIVE,
+        fingerprint="live-synthetic",
+        counts={"running": 2},
+        blocked_ids=(),
+        live_task_ids=(),
+        tasks=(),
+    )
 
 
-class ThreadOnlyResolution(unittest.TestCase):
-    def test_thread_as_chat_shape_resolves_uniquely(self):
-        entry = Entry("session-thread-chat", session_key("fixture-thread-chat"), make_source("fixture-thread-chat"))
-        runner = fresh(entries=[entry])
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(thread_id="fixture-thread-chat"))
-        )
-        self.assertTrue(decision.ready, decision.reason_code)
-        self.assertEqual(decision.target.session_id, "session-thread-chat")
-
-    def test_explicit_thread_id_resolves_uniquely(self):
-        entry = Entry("session-explicit", session_key("fixture-explicit"), make_source("fixture-explicit", thread_id="fixture-explicit-thread"))
-        runner = fresh(entries=[entry])
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(thread_id="fixture-explicit-thread"))
-        )
-        self.assertTrue(decision.ready, decision.reason_code)
-        self.assertEqual(decision.target.session_key, entry.session_key)
-
-    def test_true_thread_selector_ambiguity_holds_and_injects_zero(self):
-        entries = [
-            Entry("ambiguous-one", session_key("fixture-ambiguous-one"), make_source(SHARED_THREAD)),
-            Entry("ambiguous-two", session_key("fixture-ambiguous-two"), make_source(SHARED_THREAD)),
-        ]
-        adapter = PropertyAdapter()
-        runner = fresh(entries=entries, adapter=adapter)
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(thread_id=SHARED_THREAD))
-        )
-        self.assertFalse(decision.ready)
-        self.assertEqual(decision.reason_code, "HOLD_SESSION_AMBIGUOUS")
-        self.assertIsNone(decision.target)
-        self.assertEqual(adapter.events, [])
-        with __import__("tempfile").TemporaryDirectory() as td:
-            report = asyncio.run(run_tick(runner, Path(td) / "state.sqlite3", root_rows(provenance(thread_id=SHARED_THREAD))))
-        self.assertEqual(report["triggers"], 0)
-        self.assertEqual(adapter.events, [])
-        self.assertIn("HOLD_SESSION_AMBIGUOUS", json.dumps(report["errors"]))
-
-
-class ConjunctiveAndWrongSink(unittest.TestCase):
-    def test_wrong_sink_selector_conflict_is_unresolvable(self):
-        runner = fresh()
-        decision = mod.resolve_creator_target(
-            runner,
-            mod.parse_creator_provenance(
-                provenance(session_key=KEY_CREATOR, chat_id=WRONG_SINK_CHAT)
-            ),
-        )
-        self.assertFalse(decision.ready)
-        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
-
-    def test_creator_thread_does_not_select_wrong_sink(self):
-        entries = [
-            Entry("creator-thread", session_key("fixture-creator-thread"), make_source("fixture-creator-thread")),
-            Entry("wrong-thread", session_key("fixture-wrong-thread"), make_source("fixture-wrong-thread")),
-        ]
-        runner = fresh(entries=entries)
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(thread_id="fixture-creator-thread"))
-        )
-        self.assertTrue(decision.ready, decision.reason_code)
-        self.assertEqual(decision.target.session_id, "creator-thread")
-        self.assertNotEqual(decision.target.session_id, "wrong-thread")
-
-    def test_contradictory_session_id_and_key_holds(self):
-        runner = fresh()
-        decision = mod.resolve_creator_target(
-            runner,
-            mod.parse_creator_provenance(
-                provenance(session_id="session-creator", session_key=KEY_WRONG)
-            ),
-        )
-        self.assertFalse(decision.ready)
-        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
-
-    def test_session_key_whitespace_does_not_match_exact_record(self):
-        runner = fresh()
-        decision = mod.resolve_creator_target(
-            runner,
-            mod.parse_creator_provenance(provenance(session_key=" " + KEY_CREATOR)),
-        )
-        self.assertFalse(decision.ready)
-        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
-
-    def test_unknown_selector_key_is_malformed(self):
-        text = (
-            "[creator-session-provenance/v1]"
-            + json.dumps({"profile": PROFILE, "source": "discord", "bogus": "x"}, separators=(",", ":"))
-            + "[/creator-session-provenance/v1]"
-        )
-        decision = mod.parse_creator_provenance(text)
-        self.assertEqual(decision.reason_code, "HOLD_PROVENANCE_MALFORMED")
-
-
-class ProvenanceAndUnresolvable(unittest.TestCase):
-    def test_missing_block_holds(self):
-        self.assertEqual(mod.parse_creator_provenance("no block").reason_code, "HOLD_PROVENANCE_MISSING")
-
-    def test_malformed_json_holds(self):
-        text = "[creator-session-provenance/v1]{\"profile\":[/creator-session-provenance/v1]"
-        self.assertEqual(mod.parse_creator_provenance(text).reason_code, "HOLD_PROVENANCE_MALFORMED")
-
-    def test_multiple_blocks_hold(self):
-        text = provenance(session_key=KEY_CREATOR) + provenance(session_key=KEY_WRONG)
-        self.assertEqual(mod.parse_creator_provenance(text).reason_code, "HOLD_PROVENANCE_MULTIPLE")
-
-    def test_duplicate_json_key_holds(self):
-        text = "[creator-session-provenance/v1]{\"profile\":\"default\",\"profile\":\"default\",\"source\":\"discord\"}[/creator-session-provenance/v1]"
-        self.assertEqual(mod.parse_creator_provenance(text).reason_code, "HOLD_PROVENANCE_MALFORMED")
-
-    def test_empty_selectors_are_unresolvable(self):
-        runner = fresh()
-        decision = mod.resolve_creator_target(runner, mod.parse_creator_provenance(provenance()))
-        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
-
-    def test_conversation_id_is_unresolvable(self):
-        runner = fresh()
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(conversation_id="fixture-conversation"))
-        )
-        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
-
-    def test_missing_store_match_is_unresolvable(self):
-        runner = fresh()
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=session_key("fixture-missing")))
-        )
-        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
-
-    def test_missing_provenance_tick_has_zero_injection(self):
-        adapter = PropertyAdapter()
-        runner = fresh(adapter=adapter)
-        with __import__("tempfile").TemporaryDirectory() as td:
-            report = asyncio.run(run_tick(runner, Path(td) / "state.sqlite3", root_rows("body without provenance")))
-        self.assertEqual(report["triggers"], 0)
-        self.assertEqual(report["families"], 0)
-        self.assertEqual(adapter.events, [])
-        self.assertIn("HOLD_PROVENANCE_MISSING", json.dumps(report["errors"]))
-
-
-class ConcurrentSessionIsolation(unittest.TestCase):
-    def test_two_creator_sessions_remain_isolated(self):
-        first = Entry("session-one", session_key("fixture-one"), make_source("fixture-one", thread_id="thread-one"))
-        second = Entry("session-two", session_key("fixture-two"), make_source("fixture-two", thread_id="thread-two"))
-        runner = fresh(entries=[first, second])
-        one = mod.resolve_creator_target(runner, mod.parse_creator_provenance(provenance(session_key=first.session_key)))
-        two = mod.resolve_creator_target(runner, mod.parse_creator_provenance(provenance(session_key=second.session_key)))
-        self.assertTrue(one.ready and two.ready)
-        self.assertEqual(one.target.session_id, first.session_id)
-        self.assertEqual(two.target.session_id, second.session_id)
-        self.assertNotEqual(one.target.session_key, two.target.session_key)
-        self.assertIs(one.adapter, two.adapter)
-
-
-class StoredSessionSource(unittest.TestCase):
-    def test_selected_source_fields_and_canonical_key_are_preserved(self):
-        source = make_source(
-            "fixture-rich-chat",
-            thread_id="fixture-rich-thread",
-            chat_type="thread",
-            profile=PROFILE,
-            chat_name="Rich fixture",
-            parent_chat_id="fixture-parent",
-            user_id="fixture-user",
-            user_name="Fixture User",
-            user_id_alt="fixture-user-alt",
-            chat_id_alt="fixture-chat-alt",
-            chat_topic="Fixture topic",
-            scope_id="fixture-scope",
-            guild_id="fixture-guild",
-        )
-        entry = Entry("session-rich", session_key_for_source(source), source)
-        runner = fresh(entries=[entry])
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=entry.session_key))
-        )
-        self.assertTrue(decision.ready, decision.reason_code)
-        target = decision.target
-        self.assertEqual(target.session_id, entry.session_id)
-        self.assertEqual(target.session_key, entry.session_key)
-        self.assertEqual(target.chat_id, source.chat_id)
-        self.assertEqual(target.thread_id, source.thread_id)
-        self.assertEqual(target.chat_name, source.chat_name)
-        self.assertEqual(target.parent_chat_id, source.parent_chat_id)
-        self.assertEqual(target.user_id, source.user_id)
-        self.assertEqual(target.user_name, source.user_name)
-        self.assertEqual(target.user_id_alt, source.user_id_alt)
-        self.assertEqual(target.chat_id_alt, source.chat_id_alt)
-        self.assertEqual(target.chat_topic, source.chat_topic)
-        self.assertEqual(target.scope_id, source.scope_id)
-        self.assertEqual(target.guild_id, source.guild_id)
-        self.assertIs(decision.adapter, runner._adapters[("discord", PROFILE)])
-
-    def test_injection_receives_stored_source_identity_fields(self):
-        source = make_source(
-            "fixture-inject-chat",
-            thread_id="fixture-inject-thread",
-            parent_chat_id="fixture-inject-parent",
-            chat_name="Inject fixture",
-            user_id="fixture-inject-user",
-            user_name="Inject User",
-        )
-        entry = Entry("session-inject", session_key_for_source(source), source)
-        adapter = PropertyAdapter()
-        runner = fresh(entries=[entry], adapter=adapter)
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=entry.session_key))
-        )
-        self.assertTrue(decision.ready, decision.reason_code)
-        result = asyncio.run(
-            mod.inject_trigger(
-                runner,
-                make_trigger(decision.target, key="receipt-source"),
-                parent_channel_id="unused-parent",
-                confirmation_timeout=0,
-                resolved_adapter=decision.adapter,
-            )
-        )
-        self.assertFalse(result)
-        self.assertEqual(len(adapter.events), 1)
-        event = adapter.events[0]
-        self.assertTrue(event.internal)
-        self.assertEqual(event.source.chat_id, source.chat_id)
-        self.assertEqual(event.source.thread_id, source.thread_id)
-        self.assertEqual(event.source.parent_chat_id, source.parent_chat_id)
-        self.assertEqual(event.source.user_id, source.user_id)
-        self.assertEqual(event.source.user_name, source.user_name)
-        self.assertEqual(event.source.profile, source.profile)
-        self.assertEqual(session_key_for_source(event.source), entry.session_key)
-        self.assertIn("[kanban-origin-review:receipt-source]", event.text)
-
-
-class LiteralAuthorityScope(unittest.TestCase):
-    def _decision(self, **kwargs: Any) -> Any:
-        runner = fresh()
-        return mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR, **kwargs))
-        )
-
-    def test_uppercase_profile_is_rejected(self):
-        decision = self._decision(profile="DEFAULT")
-        self.assertEqual(decision.reason_code, "SKIP_UNSUPPORTED_SOURCE")
-
-    def test_mixed_case_profile_is_rejected(self):
-        decision = self._decision(profile="Default")
-        self.assertEqual(decision.reason_code, "SKIP_UNSUPPORTED_SOURCE")
-
-    def test_profile_whitespace_is_rejected_without_normalization(self):
-        decision = self._decision(profile=" default")
-        self.assertEqual(decision.reason_code, "SKIP_UNSUPPORTED_SOURCE")
-
-    def test_uppercase_source_is_rejected_without_normalization(self):
-        decision = self._decision(source="DISCORD")
-        self.assertEqual(decision.reason_code, "SKIP_UNSUPPORTED_SOURCE")
-
-    def test_source_whitespace_is_rejected_without_normalization(self):
-        decision = self._decision(source=" discord")
-        self.assertEqual(decision.reason_code, "SKIP_UNSUPPORTED_SOURCE")
-
-    def test_other_source_is_rejected(self):
-        decision = self._decision(source="slack")
-        self.assertEqual(decision.reason_code, "SKIP_UNSUPPORTED_SOURCE")
-
-    def test_authority_fields_are_preserved_in_parsed_claim(self):
-        claim = mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
-        self.assertEqual(claim.profile, PROFILE)
-        self.assertEqual(claim.source, "discord")
-
-
-class AdapterPropertyABI(unittest.TestCase):
-    def _resolve(self, adapter: Any) -> Any:
-        runner = fresh(adapter=adapter)
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
-        )
-        self.assertFalse(decision.ready)
-        self.assertEqual(decision.reason_code, "HOLD_DESTINATION_UNUSABLE")
-        return decision
-
-    def test_property_shaped_healthy_adapter_succeeds(self):
-        adapter = PropertyAdapter(True)
-        runner = fresh(adapter=adapter)
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
-        )
-        self.assertTrue(decision.ready, decision.reason_code)
-        self.assertIs(decision.adapter, adapter)
-
-    def test_callable_method_only_shape_is_rejected(self):
-        self._resolve(MethodOnlyAdapter())
-
-    def test_false_property_is_rejected(self):
-        self._resolve(PropertyAdapter(False))
-
-    def test_non_boolean_property_is_rejected(self):
-        self._resolve(PropertyAdapter(1))
-
-    def test_raising_property_is_rejected(self):
-        adapter = PropertyAdapter(True)
-        adapter.raise_connectivity = True
-        self._resolve(adapter)
-
-    def test_missing_adapter_is_rejected(self):
-        runner = Runner(Store(list(DEFAULT_ENTRIES)), None)
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
-        )
-        self.assertFalse(decision.ready)
-        self.assertEqual(decision.reason_code, "HOLD_DESTINATION_UNUSABLE")
-
-    def test_non_callable_handle_message_is_rejected(self):
-        adapter = PropertyAdapter(True)
-        adapter.handle_message = "not-callable"
-        self._resolve(adapter)
-
-
-class PreDispatchReadinessRace(unittest.TestCase):
-    def _assert_rejected_before_dispatch(self, mutate: Any, *, replacement: Any = None) -> None:
-        adapter = PropertyAdapter(True)
-        runner = fresh(adapter=adapter)
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
-        )
-        self.assertTrue(decision.ready, decision.reason_code)
-        self.assertIs(decision.adapter, adapter)
-        mutate(runner, adapter)
-        if replacement is not None:
-            tracked = [adapter, replacement]
-        else:
-            tracked = [adapter]
-        confirmations: list[str] = []
-        original_confirm = mod.trigger_is_confirmed
-
-        async def unexpected_confirmation(*_args: Any, **_kwargs: Any) -> bool:
-            confirmations.append("called")
-            return True
-
-        mod.trigger_is_confirmed = unexpected_confirmation
-        try:
-            with self.assertRaises(RuntimeError):
-                asyncio.run(
-                    mod.inject_trigger(
-                        runner,
-                        make_trigger(decision.target, key="race-receipt"),
-                        parent_channel_id="unused-parent",
-                        confirmation_timeout=0,
-                        resolved_adapter=decision.adapter,
-                    )
-                )
-        finally:
-            mod.trigger_is_confirmed = original_confirm
-        self.assertEqual(confirmations, [])
-        self.assertEqual(sum(len(item.events) for item in tracked), 0)
-
-    def test_disconnect_after_resolution_holds_before_handle(self):
-        self._assert_rejected_before_dispatch(lambda _runner, adapter: setattr(adapter, "connectivity", False))
-
-    def test_replacement_after_resolution_holds_on_identity(self):
-        replacement = PropertyAdapter(True)
-        self._assert_rejected_before_dispatch(
-            lambda runner, _adapter: runner._adapters.__setitem__(("discord", PROFILE), replacement),
-            replacement=replacement,
-        )
-
-    def test_missing_adapter_after_resolution_holds_before_handle(self):
-        self._assert_rejected_before_dispatch(lambda runner, _adapter: runner._adapters.clear())
-
-    def test_non_callable_handle_after_resolution_holds_before_handle(self):
-        self._assert_rejected_before_dispatch(lambda _runner, adapter: setattr(adapter, "handle_message", "nope"))
-
-    def test_false_property_after_resolution_holds_before_handle(self):
-        self._assert_rejected_before_dispatch(lambda _runner, adapter: setattr(adapter, "connectivity", False))
-
-    def test_non_boolean_property_after_resolution_holds_before_handle(self):
-        self._assert_rejected_before_dispatch(lambda _runner, adapter: setattr(adapter, "connectivity", 1))
-
-    def test_raising_property_after_resolution_holds_before_handle(self):
-        self._assert_rejected_before_dispatch(lambda _runner, adapter: setattr(adapter, "raise_connectivity", True))
-
-
-class NoHardcodedFixtureIdentity(unittest.TestCase):
-    def test_runtime_has_no_fixture_identity_literals(self):
-        text = (PACKET / "runtime.py").read_text(encoding="utf-8")
-        for value in (CREATOR_CHAT, WRONG_SINK_CHAT, SHARED_THREAD, "fixture-creator"):
-            self.assertNotIn(value, text)
+def seed_pending_and_reopen(tmp: str, target: Any) -> tuple[Any, Any]:
+    """Persist a real pending receipt through the public StateStore API, close,
+    reopen (restart equivalent), and return the reopened store plus trigger."""
+    dbpath = Path(tmp) / "state.sqlite3"
+    state = mod.StateStore(str(dbpath))
+    live = core_mod.classify_family(
+        LIVE_ROWS, root_task_id="child-fixture", links=BOARD_LINKS
+    )
+    state.observe("board-synthetic", "child-fixture", "child", target, live)
+    quiet = core_mod.classify_family(
+        QUIET_ROWS, root_task_id="child-fixture", links=BOARD_LINKS
+    )
+    trigger = None
+    for _ in range(3):
+        trigger = state.observe("board-synthetic", "child-fixture", "child", target, quiet)
+        if trigger is not None:
+            break
+    assert trigger is not None, "quiescent debounce did not emit trigger"
+    statuses = [status for status, _ in state.unfinished()]
+    assert statuses == ["pending"], statuses
+    state.close()
+    reopened = mod.StateStore(str(dbpath))
+    reopened_triggers = [t for _s, t in reopened.unfinished()]
+    assert len(reopened_triggers) == 1
+    return reopened, reopened_triggers[0]
 
 
 class RecordingResult(unittest.TextTestResult):
@@ -758,316 +426,291 @@ class RecordingResult(unittest.TextTestResult):
         self._record(test, "unexpected_success")
 
 
+# ---- acceptance cases -----------------------------------------------------------
+class ProvenanceParsing(unittest.TestCase):
+    """The strict provenance parser is the sole origin authority."""
 
-# ---- pending receipt recovery cases ---------------------------------------------
-# tick() ordering note: recovery (unfinished receipts, including a board read)
-# runs BEFORE the fresh-observation board read, so a refusing pending receipt
-# records read_root twice (recovery read + observation read).
-
-def _make_quiet_snapshot():
-    return core_mod.FamilySnapshot(
-        state="heartbeat_quiescent",
-        fingerprint="quiet-fixture",
-        counts={"ready": 1},
-        blocked_ids=(),
-        live_task_ids=(),
-        tasks=(),
-    )
-
-
-def _make_live_snapshot():
-    return core_mod.FamilySnapshot(
-        state=core_mod.HEARTBEAT_LIVE_STATE,
-        fingerprint="live-fixture",
-        counts={"running": 1},
-        blocked_ids=(),
-        live_task_ids=("root-fixture",),
-        tasks=(),
-    )
-
-
-def _creator_target_for_body(body: str) -> Any:
-    runner = fresh()
-    decision = mod.resolve_creator_target(runner, mod.parse_creator_provenance(body))
-    assert decision.ready, decision.reason_code
-    return decision.target
-
-
-def _seed_pending_and_reopen(tmp: str, target: Any) -> tuple[Any, Any]:
-    """Persist a real pending receipt through the public StateStore API, close,
-    reopen (restart equivalent), and return the reopened store plus trigger."""
-    dbpath = Path(tmp) / "state.sqlite3"
-    state = mod.StateStore(str(dbpath))
-    created = state.observe("board-fixture", "root-fixture", "root", target, _make_live_snapshot())
-    assert created is None, "live observation must arm only"
-    quiet = _make_quiet_snapshot()
-    trigger = None
-    for _ in range(2):
-        trigger = state.observe("board-fixture", "root-fixture", "root", target, quiet)
-        if trigger is not None:
-            break
-    assert trigger is not None, "quiescent debounce did not emit trigger"
-    statuses = [status for status, _ in state.unfinished()]
-    assert statuses == ["pending"], statuses
-    state.close()
-    reopened = mod.StateStore(str(dbpath))
-    reopened_triggers = [t for _s, t in reopened.unfinished()]
-    assert len(reopened_triggers) == 1
-    return reopened, reopened_triggers[0]
-
-
-class _PendingHarness:
-    """tick() recovery against a fixture board graph with call recording."""
-
-    def __init__(
-        self,
-        tmp: str,
-        *,
-        target: Any,
-        adapter: PropertyAdapter | None = None,
-        body: Any = provenance(thread_id=CREATOR_CHAT),
-        graph_error: Any = None,
-        swap_adapter_before_inject: PropertyAdapter | None = None,
-    ):
-        self.adapter = PropertyAdapter() if adapter is None else adapter
-        self.runner = fresh(adapter=self.adapter)
-        self.swap_adapter_before_inject = swap_adapter_before_inject
-        self.body = body
-        self.graph_error = graph_error
-        self.calls: list[str] = []
-        self.confirmation_calls = 0
-        self.state, self.trigger = _seed_pending_and_reopen(tmp, target)
-        self.runtime = mod.OriginReviewRuntime(
-            runner=self.runner,
-            state_store=self.state,
-            poll_seconds=1,
-            injector=self._dispatch,
+    def test_missing_block_holds(self):
+        self.assertEqual(
+            mod.parse_creator_provenance("body without any envelope").reason_code,
+            "HOLD_PROVENANCE_MISSING",
         )
-        self.runtime.board_paths = lambda: {"board-fixture": Path("/not-opened.sqlite3")}
-        self._old_graph = mod.read_board_graph
-        self._old_confirm = mod.trigger_is_confirmed
-        mod.read_board_graph = self._read_graph
 
-        async def confirmed(_runner, trigger, **_kwargs):
-            self.confirmation_calls += 1
-            return any(e.message_id == trigger.review_key for e in self.adapter.events)
+    def test_malformed_json_holds(self):
+        text = "[creator-session-provenance/v1]{\"profile\":[/creator-session-provenance/v1]"
+        decision = mod.parse_creator_provenance(text)
+        self.assertEqual(decision.reason_code, "HOLD_PROVENANCE_MALFORMED")
 
-        mod.trigger_is_confirmed = confirmed
+    def test_multiple_blocks_hold(self):
+        text = provenance(session_key=KEY_CREATOR) + provenance(session_key=KEY_WRONG)
+        self.assertEqual(mod.parse_creator_provenance(text).reason_code, "HOLD_PROVENANCE_MULTIPLE")
 
-    def _read_graph(self, _path):
-        self.calls.append("read_root")
-        if self.graph_error is not None:
-            raise self.graph_error
-        return root_rows(self.body), ()
+    def test_duplicate_json_key_holds(self):
+        text = (
+            "[creator-session-provenance/v1]"
+            "{\"profile\":\"default\",\"profile\":\"default\",\"source\":\"discord\"}"
+            "[/creator-session-provenance/v1]"
+        )
+        self.assertEqual(mod.parse_creator_provenance(text).reason_code, "HOLD_PROVENANCE_MALFORMED")
 
-    async def _dispatch(self, runner, trigger, **kwargs):
-        self.calls.append("dispatch")
-        if self.swap_adapter_before_inject is not None:
-            runner._adapters[("discord", PROFILE)] = self.swap_adapter_before_inject
-        return await mod.inject_trigger(runner, trigger, confirmation_timeout=0, **kwargs)
+    def test_unknown_selector_key_is_malformed(self):
+        text = (
+            "[creator-session-provenance/v1]"
+            + json.dumps({"profile": PROFILE, "source": "discord", "bogus": "x"}, separators=(",", ":"))
+            + "[/creator-session-provenance/v1]"
+        )
+        self.assertEqual(mod.parse_creator_provenance(text).reason_code, "HOLD_PROVENANCE_MALFORMED")
 
-    async def atick(self):
-        report = await self.runtime.tick()
-        row = self.state.conn.execute(
-            "SELECT status,error FROM family_receipts WHERE review_key=?",
-            (self.trigger.review_key,),
-        ).fetchone()
-        return report, (row["status"] if row else None), (row["error"] if row else None)
+    def test_empty_selector_value_is_malformed(self):
+        text = (
+            "[creator-session-provenance/v1]"
+            + json.dumps({"profile": PROFILE, "source": "discord", "session_key": ""}, separators=(",", ":"))
+            + "[/creator-session-provenance/v1]"
+        )
+        self.assertEqual(mod.parse_creator_provenance(text).reason_code, "HOLD_PROVENANCE_MALFORMED")
 
-    def close(self):
-        mod.read_board_graph = self._old_graph
-        mod.trigger_is_confirmed = self._old_confirm
-        self.state.close()
+    def test_missing_required_key_is_malformed(self):
+        text = (
+            "[creator-session-provenance/v1]"
+            + json.dumps({"profile": PROFILE}, separators=(",", ":"))
+            + "[/creator-session-provenance/v1]"
+        )
+        self.assertEqual(mod.parse_creator_provenance(text).reason_code, "HOLD_PROVENANCE_MALFORMED")
+
+    def test_non_dict_payload_is_malformed(self):
+        text = (
+            "[creator-session-provenance/v1]"
+            + json.dumps([PROFILE, "discord"], separators=(",", ":"))
+            + "[/creator-session-provenance/v1]"
+        )
+        self.assertEqual(mod.parse_creator_provenance(text).reason_code, "HOLD_PROVENANCE_MALFORMED")
+
+    def test_authority_fields_are_preserved_in_parsed_claim(self):
+        claim = mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        self.assertIsInstance(claim, mod.CreatorClaim)
+        self.assertEqual(claim.profile, PROFILE)
+        self.assertEqual(claim.source, "discord")
+        self.assertEqual(claim.session_key, KEY_CREATOR)
+        self.assertTrue(claim.provenance_sha256)
+
+    def test_provenance_sha256_binds_canonical_claim_bytes(self):
+        claim_a = mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        claim_b = mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        claim_c = mod.parse_creator_provenance(provenance(session_key=KEY_WRONG))
+        self.assertEqual(claim_a.provenance_sha256, claim_b.provenance_sha256)
+        self.assertNotEqual(claim_a.provenance_sha256, claim_c.provenance_sha256)
 
 
-class PendingRecoveryProvenance(unittest.TestCase):
-    """A persisted pending receipt dispatches only after the current root
-    re-proves the exact same origin through the request-local parser/resolver
-    pair, with full target agreement and the retained ready adapter."""
+class LiteralAuthorityScope(unittest.TestCase):
+    """Authority literals are exact: no case folding, no whitespace trimming."""
 
-    def _persisted_wrong_sink_target(self) -> Any:
-        return mod._session_entry_to_target(DEFAULT_ENTRIES[1])
+    def _decision(self, **kwargs: Any) -> Any:
+        runner = fresh()
+        return mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR, **kwargs))
+        )
 
-    def _creator_target(self) -> Any:
-        return _creator_target_for_body(provenance(thread_id=CREATOR_CHAT))
+    def test_uppercase_profile_is_rejected(self):
+        self.assertEqual(self._decision(profile="DEFAULT").reason_code, "SKIP_UNSUPPORTED_SOURCE")
 
-    def _run(self, harness: _PendingHarness):
-        try:
-            return asyncio.run(harness.atick())
-        finally:
-            harness.close()
+    def test_mixed_case_profile_is_rejected(self):
+        self.assertEqual(self._decision(profile="Default").reason_code, "SKIP_UNSUPPORTED_SOURCE")
 
-    def _assert_refused(self, harness, report, status):
-        self.assertNotIn("dispatch", harness.calls)
-        self.assertEqual(harness.adapter.events, [])
-        self.assertEqual(status, "uncertain")
-        self.assertIn("HOLD_PENDING_ORIGIN_UNPROVEN", json.dumps(report["errors"]))
+    def test_profile_whitespace_is_rejected_without_normalization(self):
+        self.assertEqual(self._decision(profile=" default").reason_code, "SKIP_UNSUPPORTED_SOURCE")
 
-    def test_read_precedes_dispatch_on_happy_path(self):
-        adapter = PropertyAdapter()
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(tmp, target=self._creator_target(), adapter=adapter)
-            try:
-                report, status, _error = asyncio.run(harness.atick())
-            finally:
-                harness.close()
-        self.assertEqual(harness.calls, ["read_root", "dispatch", "read_root"])
-        self.assertEqual(len(adapter.events), 1)
-        self.assertEqual(status, "confirmed")
-        self.assertEqual(report["triggers"], 1)
+    def test_uppercase_source_is_rejected_without_normalization(self):
+        self.assertEqual(self._decision(source="DISCORD").reason_code, "SKIP_UNSUPPORTED_SOURCE")
 
-    def test_missing_current_root_provenance_refuses_with_zero_injection(self):
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(tmp, target=self._creator_target(), body="")
-            report, status, _error = self._run(harness)
-        self.assertEqual(harness.calls, ["read_root", "read_root"])
-        self._assert_refused(harness, report, status)
+    def test_source_whitespace_is_rejected_without_normalization(self):
+        self.assertEqual(self._decision(source=" discord").reason_code, "SKIP_UNSUPPORTED_SOURCE")
 
-    def test_malformed_current_root_provenance_refuses_with_zero_injection(self):
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(
-                tmp,
-                target=self._creator_target(),
-                body="[creator-session-provenance/v1]{bad}[/creator-session-provenance/v1]",
-            )
-            report, status, _error = self._run(harness)
-        self.assertEqual(harness.calls, ["read_root", "read_root"])
-        self._assert_refused(harness, report, status)
+    def test_unregistered_source_is_rejected(self):
+        self.assertEqual(self._decision(source="slack").reason_code, "SKIP_UNSUPPORTED_SOURCE")
 
-    def test_multiple_conflicting_blocks_refuse_with_zero_injection(self):
-        body = provenance(thread_id=CREATOR_CHAT) + provenance(thread_id=WRONG_SINK_CHAT)
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(tmp, target=self._creator_target(), body=body)
-            report, status, _error = self._run(harness)
-        self.assertEqual(harness.calls, ["read_root", "read_root"])
-        self._assert_refused(harness, report, status)
 
-    def test_unreadable_board_refuses_with_zero_injection(self):
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(
-                tmp,
-                target=self._creator_target(),
-                graph_error=OSError("local unavailable-board fixture"),
-            )
-            report, status, _error = self._run(harness)
-        self.assertEqual(harness.calls, ["read_root", "read_root"])
-        self.assertNotIn("dispatch", harness.calls)
-        self.assertEqual(harness.adapter.events, [])
-        self.assertEqual(status, "uncertain")
-        self.assertIn("HOLD_PENDING_ORIGIN_UNPROVEN", json.dumps(report["errors"]))
+class ExactSessionRouting(unittest.TestCase):
+    """Exact selector matching over the current session store only."""
 
-    def test_persisted_wrong_sink_target_mismatch_refuses_with_zero_injection(self):
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(tmp, target=self._persisted_wrong_sink_target())
-            report, status, _error = self._run(harness)
-        self.assertIn("read_root", harness.calls)
-        self._assert_refused(harness, report, status)
+    def test_exact_session_key_resolves_to_one_stored_record(self):
+        decision = mod.resolve_creator_target(
+            fresh(), mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        self.assertEqual(decision.target.session_id, "session-creator")
+        self.assertEqual(decision.target.session_key, KEY_CREATOR)
 
-    def test_unresolvable_current_selector_refuses_with_zero_injection(self):
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(
-                tmp,
-                target=self._creator_target(),
-                body=provenance(thread_id="fixture-unknown-thread"),
-            )
-            _report, status, _error = self._run(harness)
-        self.assertNotIn("dispatch", harness.calls)
-        self.assertEqual(harness.adapter.events, [])
-        self.assertEqual(status, "uncertain")
-
-    def test_adapter_replacement_mid_dispatch_holds_uncertain_zero_events(self):
-        replacement = PropertyAdapter(True)
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(
-                tmp,
-                target=self._creator_target(),
-                swap_adapter_before_inject=replacement,
-            )
-            report, status, error = self._run(harness)
-        self.assertIn("dispatch", harness.calls)
-        self.assertEqual(harness.adapter.events, [])
-        self.assertEqual(replacement.events, [])
-        self.assertEqual(status, "uncertain")
-        self.assertIn("target adapter binding changed", json.dumps(report["errors"]))
-
-    def test_disconnected_adapter_refuses_pending_dispatch(self):
-        adapter = PropertyAdapter(False)
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(tmp, target=self._creator_target(), adapter=adapter)
-            _report, status, _error = self._run(harness)
-        self.assertNotIn("dispatch", harness.calls)
-        self.assertEqual(adapter.events, [])
-        self.assertEqual(status, "uncertain")
-
-    def test_non_callable_handle_refuses_pending_dispatch(self):
-        adapter = PropertyAdapter(True)
-        adapter.handle_message = "nope"
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(tmp, target=self._creator_target(), adapter=adapter)
-            _report, status, _error = self._run(harness)
-        self.assertNotIn("dispatch", harness.calls)
-        self.assertEqual(adapter.events, [])
-        self.assertEqual(status, "uncertain")
-
-    def test_matching_pending_target_dispatches_exactly_once(self):
-        adapter = PropertyAdapter()
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            harness = _PendingHarness(tmp, target=self._creator_target(), adapter=adapter)
-            try:
-                _report, first_status, _e = asyncio.run(harness.atick())
-                _report2, second_status, _e2 = asyncio.run(harness.atick())
-            finally:
-                harness.close()
-        self.assertEqual(len(adapter.events), 1)
-        self.assertEqual(first_status, "confirmed")
-        self.assertEqual(second_status, "confirmed")
-
-    def test_uncertain_receipt_is_confirmation_only_never_redispatched(self):
+    def test_ready_decision_retains_exact_adapter_object(self):
         adapter = PropertyAdapter()
         runner = fresh(adapter=adapter)
-        target = self._creator_target()
-        dispatches: list[str] = []
+        decision = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        self.assertIs(decision.adapter, adapter)
+        self.assertEqual(decision.delivery, "adapter")
 
-        async def _dispatch(_runner, _trigger, **_kwargs):
-            dispatches.append("dispatch")
-            return False
+    def test_thread_as_chat_shape_resolves_uniquely(self):
+        entry = Entry(
+            "session-thread-chat",
+            session_key("synthetic-thread-chat"),
+            make_source("synthetic-thread-chat"),
+        )
+        decision = mod.resolve_creator_target(
+            fresh(entries=[entry]),
+            mod.parse_creator_provenance(provenance(thread_id="synthetic-thread-chat")),
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        self.assertEqual(decision.target.session_id, "session-thread-chat")
 
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            state = mod.StateStore(str(Path(tmp) / "state.sqlite3"))
-            state.observe("board-fixture", "root-fixture", "root", target, _make_live_snapshot())
-            quiet = _make_quiet_snapshot()
-            trigger = None
-            for _ in range(2):
-                trigger = state.observe("board-fixture", "root-fixture", "root", target, quiet)
-                if trigger is not None:
-                    break
-            assert trigger is not None
-            state.set_status(trigger, "uncertain", error="fixture-seeded")
-            runtime = mod.OriginReviewRuntime(
-                runner=runner, state_store=state, poll_seconds=1, injector=_dispatch
-            )
-            runtime.board_paths = lambda: {"board-fixture": Path("/not-opened.sqlite3")}
-            old_graph = mod.read_board_graph
-            mod.read_board_graph = lambda _path: (root_rows(provenance(thread_id=CREATOR_CHAT)), ())
+    def test_explicit_thread_id_resolves_uniquely(self):
+        entry = Entry(
+            "session-explicit",
+            session_key("synthetic-explicit"),
+            make_source("synthetic-explicit", thread_id="synthetic-explicit-thread"),
+        )
+        decision = mod.resolve_creator_target(
+            fresh(entries=[entry]),
+            mod.parse_creator_provenance(provenance(thread_id="synthetic-explicit-thread")),
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        self.assertEqual(decision.target.session_key, entry.session_key)
+
+    def test_session_id_selector_resolves_uniquely(self):
+        decision = mod.resolve_creator_target(
+            fresh(), mod.parse_creator_provenance(provenance(session_id="session-creator"))
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        self.assertEqual(decision.target.session_id, "session-creator")
+
+    def test_two_creator_sessions_remain_isolated(self):
+        first = Entry("session-one", session_key("synthetic-one"), make_source("synthetic-one", thread_id="thread-one"))
+        second = Entry("session-two", session_key("synthetic-two"), make_source("synthetic-two", thread_id="thread-two"))
+        runner = fresh(entries=[first, second])
+        one = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=first.session_key))
+        )
+        two = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=second.session_key))
+        )
+        self.assertTrue(one.ready, one.reason_code)
+        self.assertTrue(two.ready, two.reason_code)
+        self.assertEqual(one.target.session_id, first.session_id)
+        self.assertEqual(two.target.session_id, second.session_id)
+        self.assertNotEqual(one.target.session_key, two.target.session_key)
+        self.assertIs(one.adapter, two.adapter)
+
+
+class UnresolvableAndAmbiguous(unittest.TestCase):
+    """Contradictory, unknown, and ambiguous claims fail closed typed."""
+
+    def test_wrong_sink_selector_conflict_is_unresolvable(self):
+        decision = mod.resolve_creator_target(
+            fresh(),
+            mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR, chat_id=WRONG_SINK_CHAT)),
+        )
+        self.assertFalse(decision.ready)
+        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
+
+    def test_creator_thread_does_not_select_wrong_sink(self):
+        entries = [
+            Entry("creator-thread", session_key("synthetic-creator-thread"), make_source("synthetic-creator-thread")),
+            Entry("wrong-thread", session_key("synthetic-wrong-thread"), make_source("synthetic-wrong-thread")),
+        ]
+        decision = mod.resolve_creator_target(
+            fresh(entries=entries),
+            mod.parse_creator_provenance(provenance(thread_id="synthetic-creator-thread")),
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        self.assertEqual(decision.target.session_id, "creator-thread")
+
+    def test_contradictory_session_id_and_key_holds(self):
+        decision = mod.resolve_creator_target(
+            fresh(),
+            mod.parse_creator_provenance(provenance(session_id="session-creator", session_key=KEY_WRONG)),
+        )
+        self.assertFalse(decision.ready)
+        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
+
+    def test_session_key_whitespace_does_not_match_exact_record(self):
+        decision = mod.resolve_creator_target(
+            fresh(),
+            mod.parse_creator_provenance(provenance(session_key=" " + KEY_CREATOR)),
+        )
+        self.assertFalse(decision.ready)
+        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
+
+    def test_empty_selectors_are_unresolvable(self):
+        decision = mod.resolve_creator_target(fresh(), mod.parse_creator_provenance(provenance()))
+        self.assertFalse(decision.ready)
+        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
+
+    def test_missing_store_match_is_unresolvable(self):
+        decision = mod.resolve_creator_target(
+            fresh(),
+            mod.parse_creator_provenance(provenance(session_key=session_key("synthetic-missing"))),
+        )
+        self.assertFalse(decision.ready)
+        self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
+
+    def test_true_thread_selector_ambiguity_holds(self):
+        entries = [
+            Entry("ambiguous-one", session_key("synthetic-ambiguous-one"), make_source(SHARED_THREAD)),
+            Entry("ambiguous-two", session_key("synthetic-ambiguous-two"), make_source(SHARED_THREAD)),
+        ]
+        adapter = PropertyAdapter()
+        decision = mod.resolve_creator_target(
+            fresh(entries=entries, adapter=adapter),
+            mod.parse_creator_provenance(provenance(thread_id=SHARED_THREAD)),
+        )
+        self.assertFalse(decision.ready)
+        self.assertEqual(decision.reason_code, "HOLD_SESSION_AMBIGUOUS")
+        self.assertIsNone(decision.target)
+        self.assertEqual(adapter.events, [])
+
+    def test_unusable_store_fails_closed(self):
+        class NoLockStore:
+            _lock = None
+
+        decision = mod.resolve_creator_target(
+            Runner(NoLockStore(), PropertyAdapter()),  # type: ignore[arg-type]
+            mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR)),
+        )
+        self.assertFalse(decision.ready)
+        self.assertIn(
+            decision.reason_code,
+            {"HOLD_SESSION_UNRESOLVABLE", "HOLD_DESTINATION_UNUSABLE"},
+        )
+
+
+class AmbiguityInjectsNothingOnTick(unittest.TestCase):
+    """An ambiguous claim produces zero dispatch at the runtime boundary."""
+
+    def test_ambiguous_selector_tick_has_zero_injection(self):
+        entries = [
+            Entry("ambiguous-one", session_key("synthetic-ambiguous-one"), make_source(SHARED_THREAD)),
+            Entry("ambiguous-two", session_key("synthetic-ambiguous-two"), make_source(SHARED_THREAD)),
+        ]
+        adapter = PropertyAdapter()
+        runner = fresh(entries=entries, adapter=adapter)
+        with tempfile.TemporaryDirectory() as td:
+            state = mod.StateStore(str(Path(td) / "state.sqlite3"))
+            runtime = mod.OriginReviewRuntime(runner=runner, state_store=state, poll_seconds=1)
+            runtime.board_paths = lambda: {"board-synthetic": Path("/not-opened.sqlite3")}
+            original = mod.read_board_graph
+            mod.read_board_graph = lambda _path: (family_rows(root_body=provenance(thread_id=SHARED_THREAD)), BOARD_LINKS)
             try:
                 report = asyncio.run(runtime.tick())
             finally:
-                mod.read_board_graph = old_graph
-            row = state.conn.execute(
-                "SELECT status FROM family_receipts WHERE review_key=?", (trigger.review_key,)
-            ).fetchone()
-            state.close()
-        self.assertEqual(dispatches, [])
+                mod.read_board_graph = original
+                state.close()
         self.assertEqual(adapter.events, [])
-        self.assertEqual(row["status"], "uncertain")
-        self.assertEqual(report["triggers"], 0)
+        self.assertIn("HOLD_SESSION_AMBIGUOUS", json.dumps(report["errors"]))
 
 
-class ProfileBridge(unittest.TestCase):
+class ProfileCanonicalization(unittest.TestCase):
     """Omitted, empty, and explicit-default stored profiles are one canonical
-    default-namespace identity and must bind and dispatch identically, with
-    the stored SessionSource representation preserved exactly; a
-    default-profile claim must never select a differently-named record."""
+    default-namespace identity; any other stored name fails closed."""
 
     def _entry(self, profile: Any, *, chat_id: str = CREATOR_CHAT) -> Entry:
         source = make_source(chat_id, thread_id=chat_id, profile=profile)
@@ -1081,45 +724,16 @@ class ProfileBridge(unittest.TestCase):
         )
         return runner, decision
 
-    def _assert_default_variant_binds(self, profile: Any) -> None:
-        entry = self._entry(profile)
-        runner, decision = self._resolve([entry])
-        self.assertTrue(decision.ready, decision.reason_code)
-        # Preserve the exact stored representation.
-        expected = profile
-        self.assertEqual(decision.target.profile, expected)
-        self.assertTrue(mod._binding_matches(runner, decision.target))
-        self.assertEqual(decision.target.session_key, entry.session_key)
-
-    def test_omitted_none_stored_profile_binds_and_matches(self):
-        self._assert_default_variant_binds(None)
-
-    def test_empty_stored_profile_binds_and_matches(self):
-        self._assert_default_variant_binds("")
-
-    def test_explicit_default_stored_profile_binds_and_matches(self):
-        self._assert_default_variant_binds("default")
-
-    def test_omitted_profile_end_to_end_dispatch_preserves_exact_source(self):
-        entry = self._entry(None)
-        adapter = PropertyAdapter()
-        runner = fresh(entries=[entry], adapter=adapter)
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=entry.session_key))
-        )
-        self.assertTrue(decision.ready, decision.reason_code)
-        asyncio.run(
-            mod.inject_trigger(
-                runner,
-                make_trigger(decision.target, key="receipt-profile"),
-                parent_channel_id="unused-parent",
-                confirmation_timeout=0,
-                resolved_adapter=decision.adapter,
-            )
-        )
-        self.assertEqual(len(adapter.events), 1)
-        self.assertIsNone(adapter.events[0].source.profile)
-        self.assertEqual(session_key_for_source(adapter.events[0].source), entry.session_key)
+    def test_all_default_variants_bind_and_match(self):
+        for profile in (None, "", "default"):
+            with self.subTest(profile=profile):
+                entry = self._entry(profile)
+                runner, decision = self._resolve([entry])
+                self.assertTrue(decision.ready, decision.reason_code)
+                # The exact stored representation is preserved on the target.
+                self.assertEqual(decision.target.profile, profile)
+                self.assertTrue(mod._binding_matches(runner, decision.target))
+                self.assertEqual(decision.target.session_key, entry.session_key)
 
     def test_non_default_stored_profile_fails_closed(self):
         entry = self._entry("work")
@@ -1129,33 +743,20 @@ class ProfileBridge(unittest.TestCase):
 
     def test_default_profile_claim_cannot_select_non_default_record(self):
         entry = self._entry("work")
-        runner = fresh(entries=[entry])
         decision = mod.resolve_creator_target(
-            runner,
+            fresh(entries=[entry]),
             mod.parse_creator_provenance(provenance(session_key=entry.session_key)),
         )
         self.assertFalse(decision.ready)
 
     def test_canonical_key_mismatch_fails_closed(self):
         entry = self._entry(None)
-        runner = fresh(entries=[entry])
         decision = mod.resolve_creator_target(
-            runner,
+            fresh(entries=[entry]),
             mod.parse_creator_provenance(provenance(session_key=KEY_WRONG)),
         )
         self.assertFalse(decision.ready)
         self.assertEqual(decision.reason_code, "HOLD_SESSION_UNRESOLVABLE")
-
-    def test_ambiguous_same_key_records_fail_closed(self):
-        first = self._entry(None)
-        second = Entry(first.session_id + "-alt", first.session_key, self._entry("default").origin)
-        runner = fresh(entries=[first, second])
-        decision = mod.resolve_creator_target(
-            runner,
-            mod.parse_creator_provenance(provenance(session_key=first.session_key)),
-        )
-        self.assertFalse(decision.ready)
-        self.assertEqual(decision.reason_code, "HOLD_SESSION_AMBIGUOUS")
 
     def test_literal_authority_variants_still_rejected(self):
         runner = fresh()
@@ -1168,9 +769,228 @@ class ProfileBridge(unittest.TestCase):
             self.assertEqual(decision.reason_code, "SKIP_UNSUPPORTED_SOURCE")
 
 
-class ParentSourcePreservation(unittest.TestCase):
-    """MessageEvent.source.parent_chat_id preserves the stored target
-    representation exactly; the caller/default parent never fills absence."""
+class AdapterPropertyABI(unittest.TestCase):
+    """The installed adapter readiness contract: boolean property + callable handle."""
+
+    def _resolve_rejected(self, adapter: Any) -> Any:
+        runner = fresh(adapter=adapter)
+        decision = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        )
+        self.assertFalse(decision.ready)
+        self.assertEqual(decision.reason_code, "HOLD_DESTINATION_UNUSABLE")
+        self.assertIsNone(decision.target)
+        return decision
+
+    def test_property_shaped_healthy_adapter_succeeds(self):
+        adapter = PropertyAdapter(True)
+        decision = mod.resolve_creator_target(
+            fresh(adapter=adapter),
+            mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR)),
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        self.assertIs(decision.adapter, adapter)
+
+    def test_callable_method_only_shape_is_rejected(self):
+        self._resolve_rejected(MethodOnlyAdapter())
+
+    def test_false_property_is_rejected(self):
+        self._resolve_rejected(PropertyAdapter(False))
+
+    def test_non_boolean_property_is_rejected(self):
+        self._resolve_rejected(PropertyAdapter(1))
+
+    def test_raising_property_is_rejected(self):
+        adapter = PropertyAdapter(True)
+        adapter.raise_connectivity = True
+        self._resolve_rejected(adapter)
+
+    def test_non_callable_handle_message_is_rejected(self):
+        adapter = PropertyAdapter(True)
+        adapter.handle_message = "not-callable"
+        self._resolve_rejected(adapter)
+
+
+class HostDeliveryFallback(unittest.TestCase):
+    """A stored discord session with NO provisioned adapter object is delivered
+    through the host-internal channel; present-but-unhealthy stays fail-closed."""
+
+    def _host_runner(self) -> HostRunner:
+        return HostRunner(Store(list(DEFAULT_ENTRIES)))
+
+    def test_absent_adapter_resolves_ready_with_host_channel(self):
+        runner = self._host_runner()
+        decision = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        self.assertEqual(decision.delivery, "host")
+        self.assertIsNone(decision.adapter)
+
+    def test_present_but_disconnected_adapter_still_fails_closed(self):
+        runner = fresh(adapter=PropertyAdapter(False))
+        decision = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        )
+        self.assertFalse(decision.ready)
+        self.assertEqual(decision.reason_code, "HOLD_DESTINATION_UNUSABLE")
+
+    def test_host_injection_reaches_host_entrypoint_with_exact_source(self):
+        runner = self._host_runner()
+        decision = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        result = asyncio.run(
+            mod.inject_trigger(
+                runner,
+                make_trigger(decision.target, key="synthetic-host-receipt"),
+                parent_channel_id="unused-parent",
+                confirmation_timeout=0,
+                resolved_adapter=None,
+                delivery="host",
+            )
+        )
+        self.assertFalse(result)  # confirmation_timeout=0 never waits for a marker
+        self.assertEqual(len(runner.host_events), 1)
+        event = runner.host_events[0]
+        self.assertTrue(event.internal)
+        self.assertEqual(event.source.chat_id, CREATOR_CHAT)
+        self.assertEqual(session_key_for_source(event.source), KEY_CREATOR)
+        self.assertIn("[kanban-origin-review:synthetic-host-receipt]", event.text)
+
+    def test_host_delivery_rejects_a_resolved_adapter(self):
+        runner = self._host_runner()
+        decision = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        )
+        with self.assertRaises(RuntimeError):
+            asyncio.run(
+                mod.inject_trigger(
+                    runner,
+                    make_trigger(decision.target, key="synthetic-host-guard"),
+                    parent_channel_id="unused-parent",
+                    confirmation_timeout=0,
+                    resolved_adapter=PropertyAdapter(),
+                    delivery="host",
+                )
+            )
+        self.assertEqual(runner.host_events, [])
+
+    def test_unknown_delivery_channel_is_rejected(self):
+        runner = self._host_runner()
+        decision = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        )
+        with self.assertRaises(RuntimeError):
+            asyncio.run(
+                mod.inject_trigger(
+                    runner,
+                    make_trigger(decision.target, key="synthetic-channel-guard"),
+                    parent_channel_id="unused-parent",
+                    confirmation_timeout=0,
+                    resolved_adapter=None,
+                    delivery="carrier-pigeon",
+                )
+            )
+        self.assertEqual(runner.host_events, [])
+
+
+class AdapterDispatchAndPreDispatchGuards(unittest.TestCase):
+    """Injection carries the exact stored identity; every mutated capability
+    re-proven at the dispatch boundary refuses with zero events."""
+
+    def test_injection_receives_stored_source_identity_fields(self):
+        source = make_source(
+            "synthetic-inject-chat",
+            thread_id="synthetic-inject-thread",
+            parent_chat_id="synthetic-inject-parent",
+            chat_name="Inject fixture",
+            user_id="synthetic-inject-user",
+            user_name="Inject User",
+        )
+        entry = Entry("session-inject", session_key_for_source(source), source)
+        adapter = PropertyAdapter()
+        runner = fresh(entries=[entry], adapter=adapter)
+        decision = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=entry.session_key))
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        asyncio.run(
+            mod.inject_trigger(
+                runner,
+                make_trigger(decision.target, key="synthetic-source-receipt"),
+                parent_channel_id="unused-parent",
+                confirmation_timeout=0,
+                resolved_adapter=decision.adapter,
+            )
+        )
+        self.assertEqual(len(adapter.events), 1)
+        event = adapter.events[0]
+        self.assertTrue(event.internal)
+        self.assertEqual(event.source.chat_id, source.chat_id)
+        self.assertEqual(event.source.thread_id, source.thread_id)
+        self.assertEqual(event.source.parent_chat_id, source.parent_chat_id)
+        self.assertEqual(event.source.user_id, source.user_id)
+        self.assertEqual(event.source.user_name, source.user_name)
+        self.assertEqual(event.source.profile, source.profile)
+        self.assertEqual(session_key_for_source(event.source), entry.session_key)
+        self.assertIn("[kanban-origin-review:synthetic-source-receipt]", event.text)
+
+    def _assert_rejected_before_dispatch(self, mutate: Any) -> None:
+        adapter = PropertyAdapter(True)
+        runner = fresh(adapter=adapter)
+        decision = mod.resolve_creator_target(
+            runner, mod.parse_creator_provenance(provenance(session_key=KEY_CREATOR))
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        mutate(runner, adapter)
+        with self.assertRaises(RuntimeError):
+            asyncio.run(
+                mod.inject_trigger(
+                    runner,
+                    make_trigger(decision.target, key="synthetic-race-receipt"),
+                    parent_channel_id="unused-parent",
+                    confirmation_timeout=0,
+                    resolved_adapter=decision.adapter,
+                )
+            )
+        self.assertEqual(adapter.events, [])
+
+    def test_disconnect_after_resolution_holds_before_handle(self):
+        self._assert_rejected_before_dispatch(
+            lambda _runner, adapter: setattr(adapter, "connectivity", False)
+        )
+
+    def test_replacement_after_resolution_holds_on_identity(self):
+        def swap(runner: Runner, _adapter: PropertyAdapter) -> None:
+            runner._adapters[(Platform.DISCORD.value, PROFILE)] = PropertyAdapter(True)
+
+        self._assert_rejected_before_dispatch(swap)
+
+    def test_missing_adapter_after_resolution_holds_before_handle(self):
+        self._assert_rejected_before_dispatch(lambda runner, _adapter: runner._adapters.clear())
+
+    def test_non_callable_handle_after_resolution_holds_before_handle(self):
+        self._assert_rejected_before_dispatch(
+            lambda _runner, adapter: setattr(adapter, "handle_message", "nope")
+        )
+
+    def test_false_property_after_resolution_holds_before_handle(self):
+        self._assert_rejected_before_dispatch(
+            lambda _runner, adapter: setattr(adapter, "connectivity", False)
+        )
+
+    def test_raising_property_after_resolution_holds_before_handle(self):
+        self._assert_rejected_before_dispatch(
+            lambda _runner, adapter: setattr(adapter, "raise_connectivity", True)
+        )
+
+
+class ParentExactPreservation(unittest.TestCase):
+    """Stored parent_chat_id travels byte-exactly (or as absence) through
+    WakeTarget, the emitted MessageEvent.source, and receipt round trips;
+    a caller/default parent never fills absence."""
 
     def _setup(self, parent_chat_id: Any):
         source = make_source(CREATOR_CHAT, thread_id=CREATOR_CHAT, parent_chat_id=parent_chat_id)
@@ -1183,7 +1003,7 @@ class ParentSourcePreservation(unittest.TestCase):
         self.assertTrue(decision.ready, decision.reason_code)
         return runner, adapter, decision
 
-    def _inject(self, runner, adapter, decision, key: str):
+    def _inject(self, runner, decision, key: str):
         return asyncio.run(
             mod.inject_trigger(
                 runner,
@@ -1193,462 +1013,13 @@ class ParentSourcePreservation(unittest.TestCase):
                 resolved_adapter=decision.adapter,
             )
         )
-
-    def test_absent_none_parent_stays_none(self):
-        runner, adapter, decision = self._setup(None)
-        self.assertIsNone(decision.target.parent_chat_id)
-        self._inject(runner, adapter, decision, "parent-none")
-        self.assertEqual(len(adapter.events), 1)
-        self.assertIsNone(adapter.events[0].source.parent_chat_id)
 
     def test_nonempty_parent_stays_byte_exact(self):
         runner, adapter, decision = self._setup("stored-parent-123")
         self.assertEqual(decision.target.parent_chat_id, "stored-parent-123")
-        self._inject(runner, adapter, decision, "parent-stored")
+        self._inject(runner, decision, "parent-stored")
         self.assertEqual(len(adapter.events), 1)
         self.assertEqual(adapter.events[0].source.parent_chat_id, "stored-parent-123")
-
-    def test_whitespace_only_parent_preserved_byte_exact(self):
-        # Preserve whitespace-only string parents byte-for-byte.
-        runner, adapter, decision = self._setup("   ")
-        self.assertEqual(decision.target.parent_chat_id, "   ")
-        self._inject(runner, adapter, decision, "parent-blank")
-        self.assertEqual(len(adapter.events), 1)
-        self.assertEqual(adapter.events[0].source.parent_chat_id, "   ")
-
-    def test_caller_fallback_never_fills_absence(self):
-        runner, adapter, decision = self._setup(None)
-        self._inject(runner, adapter, decision, "parent-no-fill")
-        self.assertEqual(len(adapter.events), 1)
-        self.assertNotEqual(adapter.events[0].source.parent_chat_id, "caller-parent-must-not-fill")
-        self.assertIsNone(adapter.events[0].source.parent_chat_id)
-
-    def test_receipt_round_trip_preserves_parent_none(self):
-        source = make_source(CREATOR_CHAT, thread_id=CREATOR_CHAT, parent_chat_id=None)
-        entry = Entry("session-parent-rt", session_key_for_source(source), source)
-        runner = fresh(entries=[entry])
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(session_key=entry.session_key))
-        )
-        self.assertTrue(decision.ready)
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            state, trigger = _seed_pending_and_reopen(tmp, decision.target)
-            try:
-                self.assertIsNone(trigger.target.parent_chat_id)
-            finally:
-                state.close()
-
-
-
-# ---- pending confirmation and representation cases ------------------------------
-
-def _make_quiet_snapshot_representation():
-    return core_mod.FamilySnapshot(
-        state="heartbeat_quiescent",
-        fingerprint="quiet-fixture",
-        counts={"ready": 1},
-        blocked_ids=(),
-        live_task_ids=(),
-        tasks=(),
-    )
-
-
-def _make_live_snapshot_representation():
-    return core_mod.FamilySnapshot(
-        state=core_mod.HEARTBEAT_LIVE_STATE,
-        fingerprint="live-fixture",
-        counts={"running": 1},
-        blocked_ids=(),
-        live_task_ids=("root-fixture",),
-        tasks=(),
-    )
-
-
-class PendingMarkerFalseConfirmation(unittest.TestCase):
-    """For a pending receipt no durable
-    marker may confirm anything before the current canonical root is read,
-    strictly parsed/resolved, and fully agreed with the persisted receipt
-    target; marker-confirm-without-resend exists only AFTER that full proof.
-    Every refusal stays typed uncertain/HOLD with zero dispatch; non-pending
-    unfinished receipts keep confirmation-only/no-resend semantics."""
-
-    def _persisted_wrong_sink_target(self):
-        return mod._session_entry_to_target(DEFAULT_ENTRIES[1])
-
-    def _creator_target(self):
-        runner = fresh()
-        decision = mod.resolve_creator_target(
-            runner, mod.parse_creator_provenance(provenance(thread_id=CREATOR_CHAT))
-        )
-        assert decision.ready, decision.reason_code
-        return decision.target
-
-    def _seed_pending(self, tmp, target):
-        dbpath = Path(tmp) / "state.sqlite3"
-        state = mod.StateStore(str(dbpath))
-        created = state.observe(
-            "board-fixture", "root-fixture", "root", target, _make_live_snapshot_representation()
-        )
-        assert created is None, "live observation must arm only"
-        quiet = _make_quiet_snapshot_representation()
-        trigger = None
-        for _ in range(2):
-            trigger = state.observe("board-fixture", "root-fixture", "root", target, quiet)
-            if trigger is not None:
-                break
-        assert trigger is not None, "quiescent debounce did not emit trigger"
-        assert [s for s, _ in state.unfinished()] == ["pending"]
-        state.close()
-        reopened = mod.StateStore(str(dbpath))
-        return reopened, [t for _s, t in reopened.unfinished()][0]
-
-    def _run_recovery(
-        self,
-        tmp,
-        *,
-        target,
-        body=provenance(thread_id=CREATOR_CHAT),
-        confirm_marker=False,
-    ):
-        """Seed a pending receipt, reopen, run one tick against a fixture
-        board with the durable marker stubbed.  Returns (report, status,
-        events, dispatches, timeline, adapter).  The timeline records the
-        exact interleaving of board reads ("read_root") and durable-marker
-        consultations ("confirm_consulted"), so ordering can be asserted
-        directly."""
-        adapter = PropertyAdapter()
-        runner = fresh(adapter=adapter)
-        dispatches: list[str] = []
-        timeline: list[str] = []
-
-        async def _dispatch(_runner, _trigger, **_kwargs):
-            dispatches.append("dispatch")
-            timeline.append("dispatch")
-            return await mod.inject_trigger(
-                _runner, _trigger, confirmation_timeout=0
-            )
-
-        state, trigger = self._seed_pending(tmp, target)
-        runtime = mod.OriginReviewRuntime(
-            runner=runner, state_store=state, poll_seconds=1, injector=_dispatch
-        )
-        runtime.board_paths = lambda: {"board-fixture": Path("/not-opened.sqlite3")}
-        old_graph = mod.read_board_graph
-        old_confirm = mod.trigger_is_confirmed
-
-        def read_graph(_path):
-            timeline.append("read_root")
-            return root_rows(body), ()
-
-        async def confirmed(_runner, _trig):
-            timeline.append("confirm_consulted")
-            return confirm_marker
-
-        mod.read_board_graph = read_graph
-        mod.trigger_is_confirmed = confirmed
-        try:
-            report = asyncio.run(runtime.tick())
-            row = state.conn.execute(
-                "SELECT status,error FROM family_receipts WHERE review_key=?",
-                (trigger.review_key,),
-            ).fetchone()
-        finally:
-            mod.read_board_graph = old_graph
-            mod.trigger_is_confirmed = old_confirm
-            state.close()
-        return (
-            report,
-            (row["status"] if row else None),
-            adapter.events,
-            dispatches,
-            timeline,
-            adapter,
-        )
-
-    # --- confirmation at a mismatched sink -------------------------------
-    def test_marker_at_wrong_sink_cannot_confirm_pending_receipt(self):
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            report, status, events, dispatches, timeline, _a = self._run_recovery(
-                tmp,
-                target=self._persisted_wrong_sink_target(),
-                confirm_marker=True,
-            )
-        self.assertEqual(dispatches, [])
-        self.assertEqual(events, [])
-        self.assertEqual(status, "uncertain")
-        self.assertIn(
-            "HOLD_PENDING_ORIGIN_UNPROVEN", json.dumps(report["errors"])
-        )
-        # The marker is NEVER consulted: the root proof refuses first.  The
-        # second read is the fresh-observation pass of the same tick.
-        self.assertEqual(timeline, ["read_root", "read_root"])
-
-    # --- marker-confirm-without-resend exists only AFTER the full proof ---
-    def test_marker_consulted_only_after_full_root_proof(self):
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            _report, status, events, dispatches, timeline, _a = self._run_recovery(
-                tmp,
-                target=self._creator_target(),
-                confirm_marker=True,
-            )
-        # Ordering: the current root is read FIRST; only then is the marker
-        # consulted (post-proof confirm-without-resend), and never dispatched.
-        self.assertEqual(
-            timeline, ["read_root", "confirm_consulted", "read_root"]
-        )
-        self.assertEqual(dispatches, [])
-        self.assertEqual(events, [])
-        self.assertEqual(status, "confirmed")
-
-    def test_marker_false_positive_on_unproven_root_keeps_zero_dispatch(self):
-        # The marker claims confirmation, but the current root is malformed:
-        # the receipt must stay uncertain with zero dispatch and the marker
-        # must not have been consulted at all.
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            _report, status, events, dispatches, timeline, _a = self._run_recovery(
-                tmp,
-                target=self._creator_target(),
-                body="[creator-session-provenance/v1]{bad}[/creator-session-provenance/v1]",
-                confirm_marker=True,
-            )
-        self.assertNotIn("confirm_consulted", timeline)
-        self.assertEqual(dispatches, [])
-        self.assertEqual(events, [])
-        self.assertEqual(status, "uncertain")
-
-    def test_marker_false_positive_on_missing_root_keeps_zero_dispatch(self):
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            _report, status, events, dispatches, timeline, _a = self._run_recovery(
-                tmp,
-                target=self._creator_target(),
-                body="",
-                confirm_marker=True,
-            )
-        self.assertNotIn("confirm_consulted", timeline)
-        self.assertEqual(dispatches, [])
-        self.assertEqual(events, [])
-        self.assertEqual(status, "uncertain")
-
-    def test_marker_false_positive_on_target_mismatch_keeps_zero_dispatch(self):
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            _report, status, events, dispatches, timeline, _a = self._run_recovery(
-                tmp,
-                target=self._persisted_wrong_sink_target(),
-                confirm_marker=True,
-            )
-        self.assertNotIn("confirm_consulted", timeline)
-        self.assertEqual(dispatches, [])
-        self.assertEqual(events, [])
-        self.assertEqual(status, "uncertain")
-
-    def test_confirmation_only_semantics_preserved_for_uncertain_receipt(self):
-        adapter = PropertyAdapter()
-        runner = fresh(adapter=adapter)
-        target = self._creator_target()
-        dispatches: list[str] = []
-        confirm_calls: list[str] = []
-
-        async def _dispatch(_runner, _trigger, **_kwargs):
-            dispatches.append("dispatch")
-            return False
-
-        with __import__("tempfile").TemporaryDirectory() as tmp:
-            state = mod.StateStore(str(Path(tmp) / "state.sqlite3"))
-            state.observe(
-                "board-fixture", "root-fixture", "root", target, _make_live_snapshot_representation()
-            )
-            quiet = _make_quiet_snapshot_representation()
-            trigger = None
-            for _ in range(2):
-                trigger = state.observe(
-                    "board-fixture", "root-fixture", "root", target, quiet
-                )
-                if trigger is not None:
-                    break
-            assert trigger is not None
-            state.set_status(trigger, "uncertain", error="fixture-seeded")
-            runtime = mod.OriginReviewRuntime(
-                runner=runner, state_store=state, poll_seconds=1, injector=_dispatch
-            )
-            runtime.board_paths = lambda: {"board-fixture": Path("/not-opened.sqlite3")}
-            old_graph = mod.read_board_graph
-            old_confirm = mod.trigger_is_confirmed
-            mod.read_board_graph = lambda _path: (
-                root_rows(provenance(thread_id=CREATOR_CHAT)),
-                (),
-            )
-
-            async def confirmed(_runner, trig):
-                confirm_calls.append(trig.review_key)
-                return True
-
-            mod.trigger_is_confirmed = confirmed
-            try:
-                report = asyncio.run(runtime.tick())
-            finally:
-                mod.read_board_graph = old_graph
-                mod.trigger_is_confirmed = old_confirm
-            row = state.conn.execute(
-                "SELECT status FROM family_receipts WHERE review_key=?",
-                (trigger.review_key,),
-            ).fetchone()
-            state.close()
-        self.assertEqual(dispatches, [])
-        self.assertEqual(adapter.events, [])
-        self.assertEqual(row["status"], "confirmed")
-        self.assertEqual(report["triggers"], 1)
-        self.assertEqual(confirm_calls, [trigger.review_key])
-
-
-class StoredProfileRepresentation(unittest.TestCase):
-    """The exact stored profile
-    representation (None, empty string, explicit default) is carried through
-    WakeTarget and the emitted MessageEvent.source; canonical default-namespace
-    identity is compared separately."""
-
-    def _entry(self, profile):
-        source = make_source(CREATOR_CHAT, thread_id=CREATOR_CHAT, profile=profile)
-        return Entry(
-            "session-profile-" + repr(profile),
-            session_key_for_source(source),
-            source,
-        )
-
-    def _resolve(self, entries):
-        runner = fresh(entries=entries)
-        decision = mod.resolve_creator_target(
-            runner,
-            mod.parse_creator_provenance(
-                provenance(session_key=entries[0].session_key)
-            ),
-        )
-        return runner, decision
-
-    def _inject(self, runner, decision, key):
-        adapter = None
-        return asyncio.run(
-            mod.inject_trigger(
-                runner,
-                make_trigger(decision.target, key=key),
-                parent_channel_id="unused-parent",
-                confirmation_timeout=0,
-                resolved_adapter=decision.adapter,
-            )
-        )
-
-    def _captured_source(self, runner, decision, key):
-        asyncio.run(
-            mod.inject_trigger(
-                runner,
-                make_trigger(decision.target, key=key),
-                parent_channel_id="unused-parent",
-                confirmation_timeout=0,
-                resolved_adapter=decision.adapter,
-            )
-        )
-        events = decision.adapter.events
-        assert len(events) == 1, len(events)
-        return events[0].source
-
-    def test_all_default_variants_bind_and_match(self):
-        for profile in (None, "", "default"):
-            with self.subTest(profile=profile):
-                entry = self._entry(profile)
-                runner, decision = self._resolve([entry])
-                self.assertTrue(decision.ready, decision.reason_code)
-                self.assertEqual(decision.target.profile, profile)
-                self.assertTrue(mod._binding_matches(runner, decision.target))
-                self.assertEqual(decision.target.session_key, entry.session_key)
-
-    def test_empty_profile_preserved_end_to_end(self):
-        entry = self._entry("")
-        runner, decision = self._resolve([entry])
-        self.assertTrue(decision.ready, decision.reason_code)
-        self.assertEqual(decision.target.profile, "")
-        source = self._captured_source(runner, decision, "profile-empty")
-        self.assertEqual(source.profile, "")
-
-    def test_explicit_default_profile_preserved_end_to_end(self):
-        entry = self._entry("default")
-        runner, decision = self._resolve([entry])
-        self.assertTrue(decision.ready, decision.reason_code)
-        self.assertEqual(decision.target.profile, "default")
-        source = self._captured_source(runner, decision, "profile-explicit")
-        self.assertEqual(source.profile, "default")
-
-    def test_omitted_profile_preserved_end_to_end(self):
-        entry = self._entry(None)
-        runner, decision = self._resolve([entry])
-        self.assertTrue(decision.ready, decision.reason_code)
-        self.assertIsNone(decision.target.profile)
-        source = self._captured_source(runner, decision, "profile-none")
-        self.assertIsNone(source.profile)
-
-    def test_profile_repr_round_trips_through_receipt(self):
-        for profile in (None, "", "default"):
-            with self.subTest(profile=profile):
-                entry = self._entry(profile)
-                runner, decision = self._resolve([entry])
-                assert decision.ready
-                with __import__("tempfile").TemporaryDirectory() as tmp:
-                    dbpath = Path(tmp) / "state.sqlite3"
-                    state = mod.StateStore(str(dbpath))
-                    state.observe(
-                        "board-fixture",
-                        "root-fixture",
-                        "root",
-                        decision.target,
-                        _make_live_snapshot_representation(),
-                    )
-                    quiet = _make_quiet_snapshot_representation()
-                    trigger = None
-                    for _ in range(2):
-                        trigger = state.observe(
-                            "board-fixture",
-                            "root-fixture",
-                            "root",
-                            decision.target,
-                            quiet,
-                        )
-                        if trigger is not None:
-                            break
-                    state.close()
-                    assert trigger is not None
-                    self.assertEqual(trigger.target.profile, profile)
-
-
-class ParentExactPreservation(unittest.TestCase):
-    """Stored parent_chat_id is carried
-    exactly when None or str (including empty and surrounding whitespace,
-    byte-for-byte) through WakeTarget, receipt round trip, and the emitted
-    MessageEvent.source; non-string values fail closed; a caller/default
-    parent never fills absence."""
-
-    def _setup(self, parent_chat_id):
-        source = make_source(
-            CREATOR_CHAT, thread_id=CREATOR_CHAT, parent_chat_id=parent_chat_id
-        )
-        entry = Entry(
-            "session-parent", session_key_for_source(source), source
-        )
-        adapter = PropertyAdapter()
-        runner = fresh(entries=[entry], adapter=adapter)
-        decision = mod.resolve_creator_target(
-            runner,
-            mod.parse_creator_provenance(provenance(session_key=entry.session_key)),
-        )
-        return runner, adapter, decision
-
-    def _inject(self, runner, decision, key):
-        return asyncio.run(
-            mod.inject_trigger(
-                runner,
-                make_trigger(decision.target, key=key),
-                parent_channel_id="caller-parent-must-not-fill",
-                confirmation_timeout=0,
-                resolved_adapter=decision.adapter,
-            )
-        )
 
     def test_empty_string_parent_preserved_byte_exact(self):
         runner, adapter, decision = self._setup("")
@@ -1662,30 +1033,22 @@ class ParentExactPreservation(unittest.TestCase):
         self.assertEqual(decision.target.parent_chat_id, "  parent-987  ")
         self._inject(runner, decision, "parent-whitespace")
         self.assertEqual(len(adapter.events), 1)
-        self.assertEqual(
-            adapter.events[0].source.parent_chat_id, "  parent-987  "
-        )
+        self.assertEqual(adapter.events[0].source.parent_chat_id, "  parent-987  ")
 
-    def test_none_parent_stays_none(self):
+    def test_none_parent_stays_none_and_caller_never_fills(self):
         runner, adapter, decision = self._setup(None)
         self.assertIsNone(decision.target.parent_chat_id)
         self._inject(runner, decision, "parent-none")
         self.assertEqual(len(adapter.events), 1)
         self.assertIsNone(adapter.events[0].source.parent_chat_id)
-
-    def test_caller_fallback_never_fills_absence(self):
-        runner, adapter, decision = self._setup(None)
-        self._inject(runner, decision, "parent-no-fill")
-        self.assertEqual(len(adapter.events), 1)
-        self.assertIsNone(adapter.events[0].source.parent_chat_id)
+        self.assertNotEqual(adapter.events[0].source.parent_chat_id, "caller-parent-must-not-fill")
 
     def test_nonstring_parent_fails_closed(self):
         source = make_source(CREATOR_CHAT, thread_id=CREATOR_CHAT)
         object.__setattr__(source, "parent_chat_id", 12345)
         entry = Entry("session-parent-invalid", session_key_for_source(source), source)
-        runner = fresh(entries=[entry])
         decision = mod.resolve_creator_target(
-            runner,
+            fresh(entries=[entry]),
             mod.parse_creator_provenance(provenance(session_key=entry.session_key)),
         )
         self.assertFalse(decision.ready)
@@ -1694,47 +1057,504 @@ class ParentExactPreservation(unittest.TestCase):
     def test_parent_round_trips_through_receipt(self):
         for parent in (None, "", "  parent-987  "):
             with self.subTest(parent=parent):
-                source = make_source(
-                    CREATOR_CHAT, thread_id=CREATOR_CHAT, parent_chat_id=parent
-                )
-                entry = Entry(
-                    "session-parent-roundtrip",
-                    session_key_for_source(source),
-                    source,
-                )
-                runner = fresh(entries=[entry])
+                source = make_source(CREATOR_CHAT, thread_id=CREATOR_CHAT, parent_chat_id=parent)
+                entry = Entry("session-parent-roundtrip", session_key_for_source(source), source)
                 decision = mod.resolve_creator_target(
-                    runner,
-                    mod.parse_creator_provenance(
-                        provenance(session_key=entry.session_key)
-                    ),
+                    fresh(entries=[entry]),
+                    mod.parse_creator_provenance(provenance(session_key=entry.session_key)),
                 )
-                assert decision.ready
-                with __import__("tempfile").TemporaryDirectory() as tmp:
-                    dbpath = Path(tmp) / "state.sqlite3"
-                    state = mod.StateStore(str(dbpath))
-                    state.observe(
-                        "board-fixture",
-                        "root-fixture",
-                        "root",
-                        decision.target,
-                        _make_live_snapshot_representation(),
-                    )
-                    quiet = _make_quiet_snapshot_representation()
-                    trigger = None
-                    for _ in range(2):
-                        trigger = state.observe(
-                            "board-fixture",
-                            "root-fixture",
-                            "root",
-                            decision.target,
-                            quiet,
-                        )
-                        if trigger is not None:
-                            break
-                    state.close()
-                    assert trigger is not None
-                    self.assertEqual(trigger.target.parent_chat_id, parent)
+                self.assertTrue(decision.ready, decision.reason_code)
+                with tempfile.TemporaryDirectory() as tmp:
+                    state, trigger = seed_pending_and_reopen(tmp, decision.target)
+                    try:
+                        self.assertEqual(trigger.target.parent_chat_id, parent)
+                    finally:
+                        state.close()
+
+
+class StoredProfileRoundTrip(unittest.TestCase):
+    """The exact stored profile representation survives the receipt round trip."""
+
+    def _entry(self, profile):
+        source = make_source(CREATOR_CHAT, thread_id=CREATOR_CHAT, profile=profile)
+        return Entry("session-profile-" + repr(profile), session_key_for_source(source), source)
+
+    def test_profile_repr_round_trips_through_receipt(self):
+        for profile in (None, "", "default"):
+            with self.subTest(profile=profile):
+                entry = self._entry(profile)
+                decision = mod.resolve_creator_target(
+                    fresh(entries=[entry]),
+                    mod.parse_creator_provenance(provenance(session_key=entry.session_key)),
+                )
+                self.assertTrue(decision.ready, decision.reason_code)
+                with tempfile.TemporaryDirectory() as tmp:
+                    state, trigger = seed_pending_and_reopen(tmp, decision.target)
+                    try:
+                        self.assertEqual(trigger.target.profile, profile)
+                    finally:
+                        state.close()
+
+
+class BoardEventVocabulary(unittest.TestCase):
+    """read_board_graph retains the status-affecting vocabulary, drops pure
+    audit noise, surfaces unknown kinds, and classify_family derives the
+    eligible postures from native evidence only."""
+
+    def _build_board(self, dbpath: Path, rows, events, links) -> None:
+        conn = sqlite3.connect(dbpath)
+        conn.executescript(
+            """
+            CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT,
+                                assignee TEXT, session_id TEXT, created_at INTEGER,
+                                block_kind TEXT, current_run_id INTEGER,
+                                last_heartbeat_at INTEGER, result TEXT);
+            CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT,
+                                      payload TEXT, run_id INTEGER, created_at INTEGER);
+            CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+            """
+        )
+        for row in rows:
+            conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)", row)
+        for event in events:
+            conn.execute(
+                "INSERT INTO task_events (task_id,kind,payload,run_id,created_at) VALUES (?,?,?,?,?)",
+                event,
+            )
+        for link in links:
+            conn.execute("INSERT INTO task_links VALUES (?,?)", link)
+        conn.commit()
+        conn.close()
+
+    def test_noise_kinds_stay_out_of_latest_events(self):
+        with tempfile.TemporaryDirectory() as td:
+            dbpath = Path(td) / "board.sqlite3"
+            self._build_board(
+                dbpath,
+                [
+                    ("a", "A", "", "ready", "builder", None, 10, None, None, None, None),
+                    ("b", "B", "", "todo", "builder", None, 11, None, None, None, None),
+                ],
+                [
+                    ("a", "reasoning_effort_set", "{}", 1, 10),
+                    ("a", "heartbeat", "{}", 1, 11),
+                    ("a", "blocked", "{\"kind\":\"needs_input\"}", 2, 20),
+                ],
+                [("a", "b")],
+            )
+            tasks, links = mod.read_board_graph(dbpath)
+            row_a = [t for t in tasks if t["id"] == "a"][0]
+            self.assertNotIn("reasoning_effort_set", row_a["latest_events"])
+            self.assertNotIn("heartbeat", row_a["latest_events"])
+            self.assertIn("blocked", row_a["latest_events"])
+            self.assertEqual(links, [("a", "b")])
+
+    def test_external_blocked_requires_verified_current_gate(self):
+        with tempfile.TemporaryDirectory() as td:
+            dbpath = Path(td) / "board.sqlite3"
+            self._build_board(
+                dbpath,
+                [
+                    ("a", "A", "", "done", "builder", None, 10, None, None, None, None),
+                    ("b", "B", "", "blocked", "builder", None, 11, "needs_input", None, None, None),
+                ],
+                [("b", "blocked", "{\"kind\":\"needs_input\"}", 3, 20)],
+                [("a", "b")],
+            )
+            tasks, links = mod.read_board_graph(dbpath)
+            snapshot = core_mod.classify_family(tasks, root_task_id="b", links=links)
+            self.assertEqual(snapshot.state, core_mod.STATE_EXTERNAL_BLOCKED)
+            self.assertIsNotNone(snapshot.gate_authority)
+            self.assertEqual(snapshot.gate_authority.kind, core_mod.STATE_EXTERNAL_BLOCKED)
+            self.assertEqual(snapshot.gate_authority.event_kind, "blocked")
+
+    def test_newer_status_affecting_event_breaks_gate_currentness(self):
+        with tempfile.TemporaryDirectory() as td:
+            dbpath = Path(td) / "board.sqlite3"
+            self._build_board(
+                dbpath,
+                [
+                    ("a", "A", "", "done", "builder", None, 10, None, None, None, None),
+                    ("b", "B", "", "blocked", "builder", None, 11, "needs_input", None, None, None),
+                ],
+                [
+                    ("b", "blocked", "{\"kind\":\"needs_input\"}", 3, 20),
+                    ("b", "claimed", "{}", 4, 30),
+                ],
+                [("a", "b")],
+            )
+            tasks, links = mod.read_board_graph(dbpath)
+            snapshot = core_mod.classify_family(tasks, root_task_id="b", links=links)
+            self.assertEqual(snapshot.state, core_mod.STATE_ACTIVE)
+            self.assertIsNone(snapshot.gate_authority)
+
+    def test_unknown_event_kind_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            dbpath = Path(td) / "board.sqlite3"
+            self._build_board(
+                dbpath,
+                [
+                    ("a", "A", "", "done", "builder", None, 10, None, None, None, None),
+                    ("b", "B", "", "blocked", "builder", None, 11, "needs_input", None, None, None),
+                ],
+                [
+                    ("b", "blocked", "{\"kind\":\"needs_input\"}", 3, 20),
+                    ("b", "brand_new_mystery_kind", "{}", 5, 31),
+                ],
+                [("a", "b")],
+            )
+            tasks, links = mod.read_board_graph(dbpath)
+            row_b = [t for t in tasks if t["id"] == "b"][0]
+            # The unknown kind is surfaced, never silently dropped...
+            self.assertIn("brand_new_mystery_kind", row_b["latest_events"])
+            # ...and the posture fails closed to active.
+            snapshot = core_mod.classify_family(tasks, root_task_id="b", links=links)
+            self.assertEqual(snapshot.state, core_mod.STATE_ACTIVE)
+
+    def test_root_completed_requires_native_completion_evidence_on_every_member(self):
+        with tempfile.TemporaryDirectory() as td:
+            dbpath = Path(td) / "board.sqlite3"
+            self._build_board(
+                dbpath,
+                [
+                    ("a", "A", "", "done", "builder", None, 10, None, None, None, "summary-a"),
+                    ("b", "B", "", "done", "builder", None, 11, None, None, None, None),
+                ],
+                [
+                    ("a", "completed", "{\"summary\":\"summary-a\"}", 1, 15),
+                    ("b", "completed", "{}", 2, 20),
+                ],
+                [("a", "b")],
+            )
+            tasks, links = mod.read_board_graph(dbpath)
+            snapshot = core_mod.classify_family(tasks, root_task_id="b", links=links)
+            self.assertEqual(snapshot.state, core_mod.STATE_ROOT_COMPLETED)
+            self.assertEqual(snapshot.gate_authority.kind, core_mod.STATE_ROOT_COMPLETED)
+            row_a = [t for t in tasks if t["id"] == "a"][0]
+            self.assertEqual(row_a["summary"], "summary-a")
+
+    def test_status_only_done_without_event_stays_active(self):
+        with tempfile.TemporaryDirectory() as td:
+            dbpath = Path(td) / "board.sqlite3"
+            self._build_board(
+                dbpath,
+                [
+                    ("a", "A", "", "done", "builder", None, 10, None, None, None, None),
+                    ("b", "B", "", "done", "builder", None, 11, None, None, None, None),
+                ],
+                [("a", "completed", "{}", 1, 15)],
+                [("a", "b")],
+            )
+            tasks, links = mod.read_board_graph(dbpath)
+            snapshot = core_mod.classify_family(tasks, root_task_id="b", links=links)
+            self.assertEqual(snapshot.state, core_mod.STATE_ACTIVE)
+
+    def test_heartbeat_lost_requires_prior_activity_and_staleness(self):
+        now = int(time.time())
+        stale = now - 2 * hermes_cli_db._STALE_HEARTBEAT_GAP_SECONDS
+        with tempfile.TemporaryDirectory() as td:
+            dbpath = Path(td) / "board.sqlite3"
+            self._build_board(
+                dbpath,
+                [
+                    ("a", "A", "", "done", "builder", None, 10, None, None, None, None),
+                    ("b", "B", "", "running", "builder", None, 11, None, 77, stale, None),
+                ],
+                [("b", "claimed", "{}", 3, stale)],
+                [("a", "b")],
+            )
+            tasks, links = mod.read_board_graph(dbpath)
+            snapshot = core_mod.classify_family(tasks, root_task_id="b", links=links, now=now)
+            self.assertEqual(snapshot.state, core_mod.STATE_HEARTBEAT_LOST)
+
+    def test_recent_heartbeat_stays_active(self):
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as td:
+            dbpath = Path(td) / "board.sqlite3"
+            self._build_board(
+                dbpath,
+                [
+                    ("a", "A", "", "done", "builder", None, 10, None, None, None, None),
+                    ("b", "B", "", "running", "builder", None, 11, None, 77, now - 30, None),
+                ],
+                [("b", "claimed", "{}", 3, now - 30)],
+                [("a", "b")],
+            )
+            tasks, links = mod.read_board_graph(dbpath)
+            snapshot = core_mod.classify_family(tasks, root_task_id="b", links=links, now=now)
+            self.assertEqual(snapshot.state, core_mod.STATE_ACTIVE)
+
+    def test_never_started_row_never_notifies(self):
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as td:
+            dbpath = Path(td) / "board.sqlite3"
+            self._build_board(
+                dbpath,
+                [
+                    ("a", "A", "", "done", "builder", None, 10, None, None, None, None),
+                    ("b", "B", "", "running", "builder", None, 11, None, None, None, None),
+                ],
+                [],
+                [("a", "b")],
+            )
+            tasks, links = mod.read_board_graph(dbpath)
+            snapshot = core_mod.classify_family(tasks, root_task_id="b", links=links, now=now)
+            self.assertEqual(snapshot.state, core_mod.STATE_ACTIVE)
+
+
+class CompletionWakeQualificationAndDedup(unittest.TestCase):
+    """Full runtime flow: an eligible posture observed twice dispatches exactly
+    one review turn; the same posture never re-dispatches; re-entry after the
+    episode closes binds to a strictly NEW review key."""
+
+    def _runtime(self, runner, state, injector=None):
+        runtime = mod.OriginReviewRuntime(
+            runner=runner, state_store=state, poll_seconds=1, injector=injector
+        )
+        runtime.board_paths = lambda: {"board-synthetic": Path("/not-opened.sqlite3")}
+        return runtime
+
+    def test_two_stable_observations_dispatch_exactly_once(self):
+        adapter = PropertyAdapter()
+        runner = fresh(adapter=adapter)
+        dispatches: list[str] = []
+
+        async def injector(_runner, trigger, **kwargs):
+            dispatches.append(trigger.review_key)
+            return await mod.inject_trigger(_runner, trigger, confirmation_timeout=0, **kwargs)
+
+        with tempfile.TemporaryDirectory() as td:
+            state = mod.StateStore(str(Path(td) / "state.sqlite3"))
+            runtime = self._runtime(runner, state, injector=injector)
+            original = mod.read_board_graph
+            try:
+                # Active posture closes any prior episode (non-eligible)...
+                mod.read_board_graph = lambda _path: (LIVE_ROWS, BOARD_LINKS)
+                live_tick = asyncio.run(runtime.tick())
+                # ...then the eligible posture is observed twice: the second
+                # stable observation completes the debounce and dispatches.
+                mod.read_board_graph = lambda _path: (QUIET_ROWS, BOARD_LINKS)
+                arm_tick = asyncio.run(runtime.tick())
+                dispatch_tick = asyncio.run(runtime.tick())
+            finally:
+                mod.read_board_graph = original
+                state.close()
+        self.assertEqual(live_tick["triggers"], 0)
+        self.assertEqual(arm_tick["triggers"], 0)
+        self.assertEqual(len(dispatches), 1)
+        self.assertEqual(len(adapter.events), 1)
+        # confirmation_timeout=0 never waits for a marker: typed uncertain.
+        self.assertEqual(dispatch_tick["triggers"], 0)
+
+    def test_same_episode_dedup_never_redispatches(self):
+        adapter = PropertyAdapter()
+        runner = fresh(adapter=adapter)
+        target = mod.resolve_creator_target(
+            fresh(), mod.parse_creator_provenance(PROVENANCE_BODY)
+        ).target
+        with tempfile.TemporaryDirectory() as tmp:
+            state = mod.StateStore(str(Path(tmp) / "state.sqlite3"))
+            live = classify_current(LIVE_ROWS)
+            quiet = classify_current(QUIET_ROWS)
+            self.assertIsNone(state.observe("board-synthetic", "child-fixture", "child", target, live))
+            self.assertIsNone(state.observe("board-synthetic", "child-fixture", "child", target, quiet))
+            trigger = state.observe("board-synthetic", "child-fixture", "child", target, quiet)
+            self.assertIsNotNone(trigger)
+            self.assertIsNone(state.observe("board-synthetic", "child-fixture", "child", target, quiet))
+            self.assertIsNone(state.observe("board-synthetic", "child-fixture", "child", target, quiet))
+            self.assertEqual(len([t for _s, t in state.unfinished()]), 1)
+            state.close()
+
+    def test_reentry_after_episode_closure_binds_new_review_key(self):
+        adapter = PropertyAdapter()
+        runner = fresh(adapter=adapter)
+        target = mod.resolve_creator_target(
+            fresh(), mod.parse_creator_provenance(PROVENANCE_BODY)
+        ).target
+        with tempfile.TemporaryDirectory() as tmp:
+            state = mod.StateStore(str(Path(tmp) / "state.sqlite3"))
+            live = classify_current(LIVE_ROWS)
+            quiet = classify_current(QUIET_ROWS)
+            state.observe("board-synthetic", "child-fixture", "child", target, live)
+            state.observe("board-synthetic", "child-fixture", "child", target, quiet)
+            first = state.observe("board-synthetic", "child-fixture", "child", target, quiet)
+            self.assertIsNotNone(first)
+            state.set_status(first, "confirmed")
+            # The confirmed episode closes on a non-eligible observation...
+            self.assertIsNone(state.observe("board-synthetic", "child-fixture", "child", target, live))
+            # ...and the next stable eligible posture binds a NEW review key.
+            state.observe("board-synthetic", "child-fixture", "child", target, quiet)
+            second = state.observe("board-synthetic", "child-fixture", "child", target, quiet)
+            self.assertIsNotNone(second)
+            self.assertNotEqual(second.review_key, first.review_key)
+            state.close()
+
+
+class PendingRecoveryMarkerFirst(unittest.TestCase):
+    """A persisted pending receipt re-proves the full current root BEFORE any
+    marker consultation or dispatch; every refusal stays typed uncertain with
+    zero injection; confirmation and dispatch are each exactly-once."""
+
+    def _harness(self, tmp, *, target, body=PROVENANCE_BODY, rows=None, graph_error=None,
+                 confirm_marker=False, adapter=None):
+        adapter = PropertyAdapter() if adapter is None else adapter
+        runner = fresh(adapter=adapter)
+        calls: list[str] = []
+        timeline: list[str] = []
+        state, trigger = seed_pending_and_reopen(tmp, target)
+
+        async def injector(_runner, trig, **kwargs):
+            calls.append("dispatch")
+            timeline.append("dispatch")
+            return await mod.inject_trigger(_runner, trig, confirmation_timeout=0, **kwargs)
+
+        runtime = mod.OriginReviewRuntime(
+            runner=runner, state_store=state, poll_seconds=1, injector=injector
+        )
+        runtime.board_paths = lambda: {"board-synthetic": Path("/not-opened.sqlite3")}
+        old_graph = mod.read_board_graph
+        old_confirm = mod.trigger_is_confirmed
+
+        def read_graph(_path):
+            timeline.append("read_root")
+            if graph_error is not None:
+                raise graph_error
+            return (rows if rows is not None else (family_rows(root_body=body))), BOARD_LINKS
+
+        async def confirmed(_runner, trig, **_kwargs):
+            timeline.append("confirm_consulted")
+            return confirm_marker
+
+        mod.read_board_graph = read_graph
+        mod.trigger_is_confirmed = confirmed
+
+        async def atick():
+            report = await runtime.tick()
+            row = state.conn.execute(
+                "SELECT status,error FROM family_receipts WHERE review_key=?",
+                (trigger.review_key,),
+            ).fetchone()
+            return report, (row["status"] if row else None), (row["error"] if row else None)
+
+        return {"atick": atick, "close": lambda: (mod.read_board_graph.__setattr__("__name__", mod.read_board_graph.__name__) or None), "adapter": adapter,
+                "calls": calls, "timeline": timeline, "state": state, "trigger": trigger,
+                "restore": lambda: None}
+
+    def _run(self, tmp, **kwargs):
+        harness = self._harness(tmp, **kwargs)
+        try:
+            report, status, error = asyncio.run(harness["atick"]())
+        finally:
+            mod.read_board_graph = mod.read_board_graph  # patched handles restored below
+        # restore module-level patches (the harness replaced them at build time)
+        state = harness["state"]
+        state.close()
+        return report, status, error, harness
+
+    def setUp(self):
+        self._original_graph = mod.read_board_graph
+        self._original_confirm = mod.trigger_is_confirmed
+
+    def tearDown(self):
+        mod.read_board_graph = self._original_graph
+        mod.trigger_is_confirmed = self._original_confirm
+
+    def _creator_target(self) -> Any:
+        decision = mod.resolve_creator_target(
+            fresh(), mod.parse_creator_provenance(PROVENANCE_BODY)
+        )
+        self.assertTrue(decision.ready, decision.reason_code)
+        return decision.target
+
+    def _wrong_sink_target(self) -> Any:
+        return mod._session_entry_to_target(DEFAULT_ENTRIES[1])
+
+    def test_missing_current_root_provenance_refuses_with_zero_injection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report, status, error, harness = self._run(
+                tmp, target=self._creator_target(), body="", rows=QUIET_ROWS_NO_PROVENANCE
+            )
+        self.assertEqual(harness["adapter"].events, [])
+        self.assertEqual(status, "uncertain")
+        self.assertIn("HOLD_PROVENANCE_MISSING", (error or "") + json.dumps(report["errors"]))
+
+    def test_malformed_current_root_provenance_refuses_with_zero_injection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report, status, error, harness = self._run(
+                tmp, target=self._creator_target(), rows=QUIET_ROWS_MALFORMED
+            )
+        self.assertEqual(harness["adapter"].events, [])
+        self.assertEqual(status, "uncertain")
+        self.assertIn("HOLD_PROVENANCE_MALFORMED", (error or "") + json.dumps(report["errors"]))
+
+    def test_unreadable_board_refuses_with_zero_injection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report, status, error, harness = self._run(
+                tmp, target=self._creator_target(), graph_error=OSError("synthetic board outage")
+            )
+        self.assertNotIn("dispatch", harness["calls"])
+        self.assertEqual(harness["adapter"].events, [])
+        self.assertEqual(status, "uncertain")
+
+    def test_persisted_wrong_sink_target_with_positive_marker_refuses(self):
+        # The marker claims confirmation, but the persisted target names a
+        # different sink than the current root proves: refusal BEFORE the
+        # marker is consulted, zero dispatch.
+        with tempfile.TemporaryDirectory() as tmp:
+            report, status, error, harness = self._run(
+                tmp, target=self._wrong_sink_target(), confirm_marker=True
+            )
+        self.assertNotIn("confirm_consulted", harness["timeline"])
+        self.assertNotIn("dispatch", harness["calls"])
+        self.assertEqual(harness["adapter"].events, [])
+        self.assertEqual(status, "uncertain")
+
+    def test_marker_confirms_only_after_full_root_proof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report, status, error, harness = self._run(
+                tmp, target=self._creator_target(), confirm_marker=True
+            )
+        self.assertIn("read_root", harness["timeline"])
+        self.assertIn("confirm_consulted", harness["timeline"])
+        self.assertNotIn("dispatch", harness["calls"])
+        self.assertEqual(harness["adapter"].events, [])
+        self.assertEqual(status, "confirmed")
+        self.assertEqual(report["triggers"], 1)
+
+    def test_matching_pending_target_dispatches_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = self._harness(tmp, target=self._creator_target(), confirm_marker=False)
+            report, status, error = asyncio.run(harness["atick"]())
+            state, trigger = harness["state"], harness["trigger"]
+            row = state.conn.execute(
+                "SELECT status,error,attempted_at FROM family_receipts WHERE review_key=?",
+                (trigger.review_key,),
+            ).fetchone()
+            state.close()
+        self.assertIn("dispatch", harness["calls"])
+        self.assertEqual(len(harness["adapter"].events), 1)
+        # Without a durable marker the dispatch is typed uncertain...
+        self.assertEqual(row["status"], "uncertain")
+        # ...and the attempt ledger durably records the ONE physical send.
+        self.assertIsNotNone(row["attempted_at"])
+
+    def test_attempted_uncertain_receipt_is_confirmation_only(self):
+        # Second tick after an attempted-but-unconfirmed dispatch: no resend,
+        # escalation only; the receipt is never re-dispatched.
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = self._harness(tmp, target=self._creator_target(), confirm_marker=False)
+            asyncio.run(harness["atick"]())
+            harness["calls"].clear()
+            report, status, error = asyncio.run(harness["atick"]())
+            state = harness["state"]
+            row = state.conn.execute(
+                "SELECT status FROM family_receipts WHERE review_key=?",
+                (harness["trigger"].review_key,),
+            ).fetchone()
+            state.close()
+        self.assertEqual(harness["calls"], [])  # zero injector entries on the second pass
+        self.assertEqual(len(harness["adapter"].events), 1)  # still exactly one physical send
+        self.assertIn("unresolved", json.dumps(report.get("errors", [])) + json.dumps(report.get("unresolved", [])))
 
 
 def iter_tests(suite: unittest.TestSuite):
